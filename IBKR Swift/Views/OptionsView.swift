@@ -11,12 +11,24 @@ import IbkrCore
 import SwiftUI
 
 struct OptionsView: View {
+    /// The ticket's current selections, for the P/L simulator.
+    @State private var simulation: SimulationInput?
+
     var body: some View {
         HSplitView {
-            StrategyTicketView()
+            StrategyTicketView(simulation: $simulation)
                 .frame(minWidth: 340, idealWidth: 380, maxWidth: 460)
-            StrategiesView()
-                .frame(minWidth: 380)
+            VStack(spacing: 0) {
+                PnLSimulatorView(input: simulation)
+                    .frame(minHeight: 300, maxHeight: 480)
+                Divider()
+                StrategiesView()
+                    .frame(minHeight: 120)
+            }
+            // Pin every bound. A split-view pane whose minimum size follows its content
+            // (live quotes, hover text) makes AppKit re-run layout mid-layout and abort the
+            // app; a nested VSplitView here did exactly that.
+            .frame(minWidth: 520, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         }
         .navigationTitle("Options")
     }
@@ -42,6 +54,29 @@ enum Eastern {
     }()
 
     static var today: String { ymd.string(from: .now) }
+
+    private static var calendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        return calendar
+    }
+
+    /// `ymd` ("YYYYMMDD") at a time of day, Eastern.
+    static func date(_ ymd: String, hour: Int, minute: Int) -> Date? {
+        self.ymd.date(from: ymd).flatMap { calendar.date(bySettingHour: hour, minute: minute, second: 0, of: $0) }
+    }
+
+    /// Today at "HH:MM" Eastern.
+    static func today(at hhmm: String) -> Date? {
+        let parts = hhmm.trimmingCharacters(in: .whitespaces).split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 2 else { return nil }
+        return date(today, hour: parts[0], minute: parts[1])
+    }
+
+    /// "Thu Oct 23 3:50 PM ET".
+    static func timeLabel(_ date: Date) -> String {
+        date.formatted(Date.FormatStyle(timeZone: timeZone).weekday(.abbreviated).month(.abbreviated).day().hour().minute()) + " ET"
+    }
 
     static func dte(_ expiry: String) -> Int? {
         guard let date = ymd.date(from: expiry), let today = ymd.date(from: today) else { return nil }
@@ -70,6 +105,8 @@ private enum TargetMode: String, CaseIterable {
 
 struct StrategyTicketView: View {
     @Environment(AppStore.self) private var store
+    /// Published for the P/L simulator next to the ticket.
+    @Binding var simulation: SimulationInput?
 
     @State private var underlying = "SPY"
     @State private var expiry: String?
@@ -145,6 +182,19 @@ struct StrategyTicketView: View {
             stopLoss: stopLoss,
             eodClose: closeAtEnabled ? closeAt.trimmingCharacters(in: .whitespaces) : nil,
             allowDelayed: !store.isLive && allowDelayed
+        )
+    }
+
+    private var simulationInput: SimulationInput? {
+        guard let option = optionSpec, quantity > 0 else { return nil }
+        return SimulationInput(
+            option: option,
+            quantity: Double(quantity),
+            multiplier: store.chain?.multiplier ?? 100,
+            triggerPrice: triggerMode == .immediately ? nil : triggerPrice.flatMap { $0 > 0 ? $0 : nil },
+            takeProfit: target(tpMode, tpValue),
+            stopLoss: target(slMode, slValue),
+            closeAt: closeAtEnabled ? closeAt : nil
         )
     }
 
@@ -250,6 +300,7 @@ struct StrategyTicketView: View {
         .monospacedDigit()
         .task { if store.chain == nil { await loadChain() } }
         .onChange(of: optionSpec) { store.watchOption(optionSpec) }
+        .onChange(of: simulationInput, initial: true) { simulation = simulationInput }
         .onChange(of: expiry) { closeAtEnabled = expiry.map { Eastern.dte($0) == 0 } ?? true }
         .confirmationDialog(confirmTitle, isPresented: $confirming, presenting: spec) { spec in
             Button(store.isLive ? "Arm LIVE Strategy" : "Arm Paper Strategy", role: store.isLive ? .destructive : nil) {

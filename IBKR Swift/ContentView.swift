@@ -41,11 +41,7 @@ struct ContentView: View {
         } detail: {
             Group {
                 if store.connection != .connected {
-                    ContentUnavailableView(
-                        store.connection == .connecting ? "Connecting…" : "Not Connected",
-                        systemImage: "bolt.horizontal.circle",
-                        description: Text("Connect to IB Gateway at \(store.host):\(String(store.port)).")
-                    )
+                    NotConnectedView()
                 } else {
                     switch selection ?? .account {
                     case .account: AccountView()
@@ -69,6 +65,31 @@ struct ContentView: View {
         case .orders: return store.openOrderCount
         case .options: return store.activeStrategyCount
         default: return 0
+        }
+    }
+}
+
+private struct NotConnectedView: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        let address = "\(store.host):\(String(store.port))"
+        if store.connection == .connecting {
+            ContentUnavailableView("Connecting…", systemImage: "bolt.horizontal.circle",
+                                   description: Text("Connecting to IB Gateway at \(address)."))
+        } else if let next = store.nextAttempt {
+            ContentUnavailableView {
+                Label("Waiting for IB Gateway", systemImage: "bolt.horizontal.circle")
+            } description: {
+                VStack(spacing: 6) {
+                    Text("Connecting automatically to \(address) once it's running and logged in.")
+                    if let error = store.lastAttemptError { Text(error).foregroundStyle(.secondary) }
+                    Text("Next try \(next, style: .relative).").monospacedDigit()
+                }
+            }
+        } else {
+            ContentUnavailableView("Not Connected", systemImage: "bolt.horizontal.circle",
+                                   description: Text("Connect to IB Gateway at \(address)."))
         }
     }
 }

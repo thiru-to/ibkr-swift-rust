@@ -34,9 +34,24 @@ final class AppStore {
         }
     }
 
-    var host = "127.0.0.1"
-    var port: Int
-    var clientId = 1
+    // Connection settings, remembered across launches.
+    var host: String { didSet { defaults.set(host, forKey: "host") } }
+    var port: Int { didSet { defaults.set(port, forKey: "port") } }
+    var clientId: Int { didSet { defaults.set(clientId, forKey: "clientId") } }
+
+    /// Connect at launch and keep retrying until Gateway answers. An explicit Disconnect
+    /// stops it until the next launch (or until it's switched off and on again).
+    var autoConnect: Bool {
+        didSet {
+            defaults.set(autoConnect, forKey: "autoConnect")
+            if autoConnect { startAutoConnect() } else { stopAutoConnect() }
+        }
+    }
+    /// While auto-connect waits for Gateway: when it tries next, and why the last try failed.
+    private(set) var nextAttempt: Date?
+    private(set) var lastAttemptError: String?
+    @ObservationIgnored private var autoConnectTask: Task<Void, Never>?
+    @ObservationIgnored private let defaults = UserDefaults.standard
 
     private(set) var connection = Connection.disconnected
     private(set) var account = ""
@@ -107,14 +122,45 @@ final class AppStore {
     @ObservationIgnored private var orderMemory: [String: (group: OrderStatusGroup, filled: Double)]?
 
     init() {
-        let mode = UserDefaults.standard.string(forKey: "tradingMode").flatMap(TradingMode.init) ?? .paper
+        let defaults = UserDefaults.standard
+        let mode = defaults.string(forKey: "tradingMode").flatMap(TradingMode.init) ?? .paper
         self.mode = mode
-        self.port = mode.defaultPort
+        host = defaults.string(forKey: "host") ?? "127.0.0.1"
+        port = defaults.object(forKey: "port") as? Int ?? mode.defaultPort
+        clientId = defaults.object(forKey: "clientId") as? Int ?? 1
+        autoConnect = defaults.object(forKey: "autoConnect") as? Bool ?? true
     }
 
     // MARK: Connection
 
-    func connect() async {
+    /// Starts auto-connect if it's on and nothing is connected. Retries back off from
+    /// 2s to 30s, so a Gateway that isn't running yet isn't hammered.
+    func startAutoConnect() {
+        guard autoConnect, autoConnectTask == nil, connection == .disconnected else { return }
+        autoConnectTask = Task { [weak self] in
+            var delay = Duration.seconds(2)
+            while let self, self.autoConnect, !Task.isCancelled, self.connection == .disconnected {
+                await self.connect(quietly: true)
+                guard self.connection == .disconnected else { break }
+                self.nextAttempt = .now + TimeInterval(delay.components.seconds)
+                try? await Task.sleep(for: delay)
+                delay = min(delay * 2, .seconds(30))
+            }
+            self?.nextAttempt = nil
+            self?.autoConnectTask = nil
+        }
+    }
+
+    private func stopAutoConnect() {
+        autoConnectTask?.cancel()
+        autoConnectTask = nil
+        nextAttempt = nil
+        lastAttemptError = nil
+    }
+
+    /// `quietly`: failures go to `lastAttemptError` (shown while waiting) instead of the
+    /// error banner, so auto-connect retries don't flash errors.
+    func connect(quietly: Bool = false) async {
         guard connection == .disconnected, let port = UInt16(exactly: port) else { return }
         connection = .connecting
         lastError = nil
@@ -131,15 +177,17 @@ final class AppStore {
                 lastError = "Paper mode is selected, but Gateway reports a live account (\(account)). Orders will use real money."
             }
             connection = .connected
+            lastAttemptError = nil
             startStreams(session)
             await refreshSummary()
         } catch {
             connection = .disconnected
-            report(error)
+            if quietly { lastAttemptError = message(error) } else { report(error) }
         }
     }
 
     func disconnect() async {
+        stopAutoConnect()
         streams.values.forEach { $0.cancel() }
         streams.removeAll()
         if let session {

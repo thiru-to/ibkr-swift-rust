@@ -18,7 +18,10 @@ struct IBKR_SwiftApp: App {
             ContentView()
                 .environment(store)
                 .frame(minWidth: 820, minHeight: 520)
-                .onAppear { appDelegate.store = store }
+                .onAppear {
+                    appDelegate.store = store
+                    store.startAutoConnect()
+                }
         }
         .defaultSize(width: 1000, height: 640)
         .commands {
@@ -35,6 +38,9 @@ struct IBKR_SwiftApp: App {
                 if store.connection != .disconnected {
                     Text("Disconnect to change mode")
                 }
+
+                Divider()
+                Toggle("Connect Automatically", isOn: $store.autoConnect)
             }
         }
     }

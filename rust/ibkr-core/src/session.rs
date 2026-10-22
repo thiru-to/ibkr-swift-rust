@@ -27,6 +27,7 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use crate::position::{self, Ctx};
+use crate::risk::{RiskGuard, RiskListener};
 use crate::strategy::{self, OwnedOrders, StrategyHandle, StrategyListener};
 use crate::types::*;
 use crate::{options, orders};
@@ -35,7 +36,7 @@ const LIVE_PORTS: [u16; 2] = [4001, 7496];
 /// How long `place_order` waits for IB's first answer before reporting "Sent".
 const ACK_WAIT: Duration = Duration::from_secs(5);
 
-fn rt() -> &'static Runtime {
+pub(crate) fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -124,6 +125,7 @@ pub struct IbkrSession {
     client_id: i32,
     /// Orders that running strategies placed; manual position actions leave them alone.
     strategy_orders: OwnedOrders,
+    risk: Arc<RiskGuard>,
 }
 
 /// Connects to TWS / IB Gateway. Requests delayed market data as a fallback so quotes
@@ -139,7 +141,11 @@ pub async fn connect(host: String, port: u16, client_id: i32) -> Result<Arc<Ibkr
             .into_iter()
             .find(|a| !a.is_empty())
             .ok_or_else(|| invalid("no managed accounts returned"))?;
-        Ok(Arc::new(IbkrSession { client: Arc::new(client), account, port, client_id, strategy_orders: OwnedOrders::default() }))
+        let client = Arc::new(client);
+        let strategy_orders = OwnedOrders::default();
+        let live = LIVE_PORTS.contains(&port) || !account.starts_with('D');
+        let risk = RiskGuard::new(client.clone(), client_id, strategy_orders.clone(), live);
+        Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk }))
     })
     .await
 }
@@ -260,7 +266,50 @@ impl IbkrSession {
         if self.is_live() || !self.account.starts_with('D') {
             spec.allow_delayed = false;
         }
-        strategy::spawn(rt(), self.client.clone(), spec, listener, self.strategy_orders.clone())
+        strategy::spawn(rt(), self.client.clone(), spec, listener, self.strategy_orders.clone(), self.risk.clone())
+    }
+
+    /// Starts the risk guard: loads the account's saved limits and halt from `state_path`,
+    /// then tracks IB's daily P&L. Cancelling the handle stops it (live sessions then refuse
+    /// entries). See `risk.rs`.
+    pub fn start_risk(&self, state_path: String, listener: Arc<dyn RiskListener>) -> Arc<StreamHandle> {
+        let (client, account, risk) = (self.client.clone(), self.account.clone(), self.risk.clone());
+        risk.start(state_path.into(), listener.clone());
+        spawn_stream(async move {
+            /// Marks the guard stopped however the task ends (including abort).
+            struct Stopped(Arc<RiskGuard>);
+            impl Drop for Stopped {
+                fn drop(&mut self) {
+                    self.0.stop();
+                }
+            }
+            let _stopped = Stopped(risk.clone());
+            let on_error = |e: String| listener.on_error(format!("Daily P&L: {e}"));
+            let pnl = keep_streaming(&client, on_error, || stream_pnl(&client, &account, &risk));
+            let roll = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    risk.tick();
+                }
+            };
+            tokio::join!(pnl, roll);
+        })
+    }
+
+    pub fn risk_status(&self) -> RiskStatus {
+        self.risk.status()
+    }
+
+    /// Tighter limits apply now; looser ones from the next trading day.
+    pub fn set_risk_limits(&self, limits: RiskLimits) -> Result<RiskStatus, IbkrError> {
+        self.risk.set_limits(limits)
+    }
+
+    /// Kill switch: no opening orders for the rest of the trading day. Disarms strategies
+    /// that haven't bought, cancels entries in flight and this client's manual buys. Exits
+    /// stay at IB.
+    pub fn halt_trading(&self, reason: String) {
+        self.risk.halt(reason);
     }
 
     /// Quote for any contract by IB contract id (a position's); `Quote.symbol` is IB's local symbol.
@@ -330,9 +379,30 @@ impl IbkrSession {
     /// `subscribe_orders`.
     pub async fn place_order(&self, request: OrderRequest) -> Result<PlacedOrder, IbkrError> {
         validate_order(&request)?;
-        let client = self.client.clone();
+        let (client, account, risk) = (self.client.clone(), self.account.clone(), self.risk.clone());
         run(async move {
-            let contract = Contract::stock(request.symbol.trim().to_uppercase()).build();
+            let symbol = request.symbol.trim().to_uppercase();
+            let contract = Contract::stock(symbol.clone()).build();
+            match request.side {
+                OrderSide::Buy => {
+                    let price = match request.kind {
+                        OrderKind::Limit { price } => Some(price),
+                        OrderKind::Market if risk.checks_cost() => snapshot_ask(&client, &contract).await,
+                        OrderKind::Market => None,
+                    };
+                    risk.check_entry(price.map(|p| p * request.quantity))?;
+                }
+                // While halted, a sell may close a long but not open a short.
+                OrderSide::Sell if risk.halted().is_some() => {
+                    let held = position::stock_position(&client, &account, &symbol).await?;
+                    if request.quantity > held {
+                        return Err(invalid(format!(
+                            "Trading is halted for today; sells are limited to the {held} {symbol} shares you hold."
+                        )));
+                    }
+                }
+                OrderSide::Sell => {}
+            }
             let builder = client.order(&contract);
             let builder = match request.side {
                 OrderSide::Buy => builder.buy(request.quantity),
@@ -622,6 +692,50 @@ async fn stream_quote(client: &Client, contract: &Contract, symbol: String, list
         }
     }
     Ok(())
+}
+
+/// The first ask IB reports for `contract`, waiting up to 3s; None if there's none.
+pub(crate) async fn snapshot_ask(client: &Client, contract: &Contract) -> Option<f64> {
+    let mut sub = client.market_data(contract).subscribe().await.ok()?.filter_data();
+    let first = async {
+        while let Some(Ok(tick)) = sub.next().await {
+            if let Some(ask) = ask_of(&tick) {
+                return Some(ask);
+            }
+        }
+        None
+    };
+    tokio::time::timeout(Duration::from_secs(3), first).await.ok().flatten()
+}
+
+/// The ask in a tick, if it carries one (live or delayed).
+pub(crate) fn ask_of(tick: &TickTypes) -> Option<f64> {
+    let (kind, price) = match tick {
+        TickTypes::Price(t) => (&t.tick_type, t.price),
+        TickTypes::PriceSize(t) => (&t.price_tick_type, t.price),
+        _ => return None,
+    };
+    (matches!(kind, TickType::Ask | TickType::DelayedAsk) && price.is_finite() && price > 0.0).then_some(price)
+}
+
+// ---------------------------------------------------------------------------
+// Daily P&L (risk guard)
+// ---------------------------------------------------------------------------
+
+async fn stream_pnl(client: &Client, account: &str, risk: &RiskGuard) -> Result<(), IbkrError> {
+    let result = async {
+        let mut sub = client.pnl(&AccountId(account.to_string()), None).await?.filter_data();
+        while let Some(item) = sub.next().await {
+            // IB sends Double.MAX for "no value".
+            let daily = item?.daily_pnl;
+            risk.set_pnl((daily.is_finite() && daily.abs() < 1e12).then_some(daily));
+        }
+        Ok::<(), IbkrError>(())
+    }
+    .await;
+    // No reading is current until the stream is back.
+    risk.set_pnl(None);
+    result
 }
 
 // ---------------------------------------------------------------------------

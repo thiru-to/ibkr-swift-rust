@@ -206,6 +206,13 @@ struct StrategyTicketView: View {
         return nil
     }
 
+    /// Checked again by the Rust side when the entry is sent, at the ask then.
+    private var riskProblem: String? {
+        guard let spec else { return nil }
+        let cost = store.optionQuote?.ask.map { $0 * spec.quantity * (store.chain?.multiplier ?? 100) }
+        return store.entryProblem(cost: cost)
+    }
+
     var body: some View {
         Form {
             Section("Contract") {
@@ -291,8 +298,11 @@ struct StrategyTicketView: View {
             }
 
             Section {
+                if let riskProblem {
+                    Label(riskProblem, systemImage: "hand.raised.fill").font(.callout).foregroundStyle(.red)
+                }
                 Button(triggerMode == .immediately ? "Review Buy…" : "Review & Arm…") { confirming = true }
-                    .disabled(spec == nil || triggerProblem != nil)
+                    .disabled(spec == nil || triggerProblem != nil || riskProblem != nil)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }

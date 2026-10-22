@@ -5,6 +5,7 @@
 //  Created by Aingaran on 2026-10-22.
 //
 
+import IbkrCore
 import SwiftUI
 
 enum SidebarItem: String, CaseIterable, Identifiable {
@@ -99,6 +100,10 @@ private struct Banners: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let reason = store.risk?.halted {
+                Banner(icon: "hand.raised.fill", tint: .red,
+                       text: "Trading halted for today: \(reason). New entries are blocked until the next trading day; exits still work.")
+            }
             if let problem = store.linkProblem {
                 Banner(icon: "wifi.exclamationmark", tint: .orange,
                        text: "\(problem) Orders and positions may be out of date until it's back.")

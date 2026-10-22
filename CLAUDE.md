@@ -11,6 +11,7 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 - Every order submit in `OrdersView.swift` goes through a confirmation sheet (`OrderConfirmSheet`) that shows the account, LIVE/PAPER and price sanity warnings (`OrderCheck`). Keep that step, and keep the submit button free of a Return shortcut.
 - Position actions (`PositionDetailView.swift`: close, add stop/take-profit, edit a working order's price) also go through a review panel showing LIVE/PAPER, with no Return shortcut. Keep that.
 - Arming a strategy (`OptionsView.swift`) goes through a confirmation dialog showing LIVE/PAPER. The P/L simulator next to the ticket is display-only and must stay that way.
+- Risk controls (`risk.rs`, below) gate every opening order. Never add an order path that skips `RiskGuard::check_entry`, and never gate an exit with it.
 - Quitting while a strategy still depends on the app (trigger not fired, entry in flight, app-side EOD close) asks first (`AppDelegate.applicationShouldTerminate`).
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
 
@@ -26,7 +27,7 @@ cargo test                          # all tests
 cargo test -p ibkr-core coalesces_ticks   # a single test by name
 cargo test -p ibkr-core strategy::   # one module's tests
 cargo clippy --all-targets
-cargo run --example smoke -- 4002 AAPL   # read-only check against the running Gateway (paper by default; 4001 = live)
+cargo run --example smoke -- 4002 AAPL   # read-only check against the running Gateway (paper by default; 4001 = live); its risk state goes to a temp file
 
 # Regenerate Swift bindings + xcframework (normally done automatically by the scheme;
 # always builds Rust in release, since pre-actions don't reliably see the configuration)
@@ -51,7 +52,7 @@ SwiftUI views (IBKR Swift/, MainActor by default)
 
 - **Rust (`rust/ibkr-core/src/session.rs`)**: everything runs on one `OnceLock` Tokio runtime.
   - Async exports wrap their work in `run(...)`, which spawns onto that runtime. UniFFI's executor only polls a `JoinHandle`, so no `async_runtime` attribute is needed.
-  - Streams are spawned tasks that push **full snapshots** to a foreign listener trait: positions (`PositionsListener`), quotes by symbol / option / conid (`QuoteListener`), orders (`OrdersListener`), link status (`ConnectionListener`) and strategies (`StrategyListener`, in `strategy.rs`).
+  - Streams are spawned tasks that push **full snapshots** to a foreign listener trait: positions (`PositionsListener`), quotes by symbol / option / conid (`QuoteListener`), orders (`OrdersListener`), link status (`ConnectionListener`), strategies (`StrategyListener`, in `strategy.rs`) and risk status (`RiskListener`, in `risk.rs`).
   - Every stream returns a `StreamHandle`. Calling `cancel()` or dropping it aborts the task, and dropping the `ibapi` subscription sends the IB-side cancel.
   - FFI types live in `types.rs`.
 - **Placing orders**: `place_order` uses `client.place_order` (not the builder's fire-and-forget `submit()`) and waits up to 5s for IB's first answer. A rejection (`ibapi::Error::Notice`) comes back as an error; no answer yet returns status "Sent". Dropping a `PlaceOrder` subscription does not cancel the order.
@@ -66,7 +67,7 @@ SwiftUI views (IBKR Swift/, MainActor by default)
 
 ## App (Swift)
 
-- Screens (`SidebarItem` in `ContentView.swift`): Account, Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies), Orders (ticket + list). The sidebar badges working orders and running strategies.
+- Screens (`SidebarItem` in `ContentView.swift`): Account (with the Risk card, `RiskView.swift`), Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies), Orders (ticket + list). The sidebar badges working orders and running strategies.
 - `AppStore` keeps one `StreamHandle` per key in `streams` (`"link"`, `"quote"`, `"ticket"`, `"position"`, `"underlying"`, …). Re-subscribing a key cancels the old handle first. `watched` remembers each quote key's symbol so `resubscribeQuotes` can re-request them after `RestoredDataLost`.
 - **Auto-connect** (Account menu → Connect Automatically, on by default): `startAutoConnect` runs at launch and retries with backoff from 2s to 30s while Gateway isn't up. Retry failures go to `lastAttemptError` (shown on the "Waiting for IB Gateway" screen), not the error banner. An explicit Disconnect stops it until next launch or a toggle.
 - **P/L simulator** (`PnLSimulatorView.swift`, `OptionMath.swift`): Black-Scholes, European, no dividends, a flat 4% rate, one volatility. IV is solved from the option's mid (or last/ask); entry is the ask for buy-now, or the theoretical price at the trigger plus half the spread. The time slider defaults to the ticket's close-at time. The ticket publishes its selections as `SimulationInput` via a binding.
@@ -93,6 +94,24 @@ One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDela
 - **`resolve_option` trims the expiry date.** `contract_details` returns `last_trade_date_or_contract_month` as "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (error 10372), so it's cut down to YYYYMMDD.
 - **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
 - **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Both runs passed on 2026-10-22, and IB accepted the time-conditioned EOD order inside the OCA group. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
+
+## Risk controls (`rust/ibkr-core/src/risk.rs`)
+
+One `RiskGuard` per session (created in `connect`, started by Swift with `start_risk`). Limits: max daily loss and max cost per trade, each off when None. Invariants to preserve:
+
+- **Only opening orders are checked**: strategy entries and manual buys (`place_order`). Exits, position close / protect / modify and cancels never are, because blocking an exit adds risk. While halted, a manual sell is allowed only up to the long stock position (`position::stock_position`), so it can't open a short.
+- **Strategies are checked twice**: at arming (halt only) and right before the entry is sent (halt, daily P&L, cost). The cost uses the option's ask, kept live while armed (`wait_for_trigger` subscribes to it), or a 3s snapshot (`session::snapshot_ask`) when there's none.
+- **Fail closed**:
+  - With a daily loss limit set, entries wait for a current P&L reading. `stream_pnl` sets it to None whenever the stream drops.
+  - A cost limit with no price refuses the entry.
+  - Live sessions (live port or non-`D` account) refuse entries while the guard isn't running.
+  - An unreadable state file halts trading for the day.
+- **Daily loss** uses IB's account daily P&L (realized + unrealized, `client.pnl`). Reaching −limit halts automatically. IB sends `Double.MAX` for "no value", which is filtered out.
+- **A halt lasts until the US/Eastern day rolls over** (`trading_day`, checked on every call and every 30s), not until IB's own P&L reset. It's saved per account (Swift passes `Application Support/Risk/<account>.json`; written via a temp file and rename), so restarts don't lift it. There's no way to lift a halt early. That's deliberate.
+- **Tightening a limit applies now; loosening (including turning one off) waits for the next trading day** (`RiskBook::set_limits` keeps the looser request in `pending`).
+- **Halting** broadcasts on a `watch` channel. Strategies that haven't bought end Disarmed, and an entry in flight is cancelled like Disarm (a partial fill still gets its exits). It also cancels this client's working manual buy orders (`cancel_manual_buys`). TWS and other clients' orders are untouched.
+- The pure rules live in `RiskBook` (unit tested). Swift mirrors them in `AppStore.entryProblem` for instant feedback only; the Rust side decides.
+- Paper check: `cargo run --example strategy_paper -- halt` arms an untriggerable strategy, halts, and verifies the disarm and the refusals. It places nothing unless the guard is broken (then it cancels the $1 limit it sent). The halt there isn't saved, since the example doesn't start the guard.
 
 ## Orders list (`rust/ibkr-core/src/orders.rs`)
 

@@ -41,6 +41,7 @@ struct AccountView: View {
                     StatCard(title: "Unrealized", value: s?.unrealizedPnl.money(currency) ?? "—", tint: pnlColor(s?.unrealizedPnl))
                     StatCard(title: "Realized", value: s?.realizedPnl.money(currency) ?? "—", tint: pnlColor(s?.realizedPnl))
                 }
+                RiskSection()
             }
             .padding(20)
         }

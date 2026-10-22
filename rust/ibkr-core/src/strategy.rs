@@ -4,7 +4,10 @@
 //! - The trigger never fires on delayed data unless `allow_delayed` (forced off on live).
 //! - The trigger must be *crossed* after arming: the first last-trade tick is a baseline,
 //!   and arming fails if the baseline is already through the trigger.
-//! - The entry is sent at most once (the task only moves forward).
+//! - The entry is sent at most once (the task only moves forward), and only after the risk
+//!   guard approves it at that moment (halt, daily loss, cost at the current ask). A halt
+//!   disarms a strategy that hasn't bought and cancels an entry in flight; exits are never
+//!   blocked.
 //! - Every sell-to-close (take-profit, stop, EOD close, close-now) shares one OCA group with
 //!   ReduceWithBlock: a fill on one shrinks the others by the same amount, so together they
 //!   never sell more than the position and none can open a short.
@@ -29,9 +32,11 @@ use ibapi::subscriptions::SubscriptionItemStreamExt;
 use jiff::Zoned;
 use jiff::civil::Time;
 use jiff::tz::TimeZone;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::options::{self, ResolvedContract, Round};
+use crate::risk::RiskGuard;
+use crate::session::{ask_of, snapshot_ask};
 use crate::types::*;
 
 #[uniffi::export(with_foreign)]
@@ -80,11 +85,12 @@ pub(crate) fn spawn(
     spec: StrategySpec,
     listener: Arc<dyn StrategyListener>,
     owned: OwnedOrders,
+    risk: Arc<RiskGuard>,
 ) -> Arc<StrategyHandle> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime.spawn(run(client, id, spec, listener, rx, owned));
+    runtime.spawn(run(client, id, spec, listener, rx, owned, risk));
     Arc::new(StrategyHandle { id, cmds: tx })
 }
 
@@ -287,6 +293,7 @@ async fn run(
     listener: Arc<dyn StrategyListener>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     owned: OwnedOrders,
+    risk: Arc<RiskGuard>,
 ) {
     let mut t = Tracker {
         u: StrategyUpdate {
@@ -331,15 +338,30 @@ async fn run(
     let zero_dte = spec.option.expiry == now.strftime("%Y%m%d").to_string();
     let exit_tif = if zero_dte { ibapi::orders::TimeInForce::Day } else { ibapi::orders::TimeInForce::GoodTillCanceled };
 
+    if let Some(reason) = risk.halted() {
+        return t.set(StrategyState::Failed, format!("Not armed: trading is halted for today ({reason})"));
+    }
+    let mut halt = risk.subscribe_halt();
+
+    let mut ask = None;
     if let Some(trigger) = &spec.trigger {
-        match wait_for_trigger(&client, trigger, spec.allow_delayed, &mut t, &mut cmds).await {
-            Ok(true) => {}
-            Ok(false) => return t.set(StrategyState::Disarmed, "Disarmed before trigger"),
+        match wait_for_trigger(&client, trigger, &opt, spec.allow_delayed, &mut t, &mut cmds, &mut halt).await {
+            Ok(TriggerEnd::Fired { ask: latest }) => ask = latest,
+            Ok(TriggerEnd::Disarmed(why)) => return t.set(StrategyState::Disarmed, why),
             Err(e) => return t.set(StrategyState::Failed, e),
         }
     }
 
-    let (filled, fill) = match enter(&client, &opt, spec.quantity, &mut t, &mut cmds).await {
+    // The last check before money moves: halt, daily loss, and the cost at the current ask.
+    if ask.is_none() && risk.checks_cost() {
+        ask = snapshot_ask(&client, &opt.contract).await;
+    }
+    if let Err(e) = risk.check_entry(ask.map(|a| a * spec.quantity * opt.multiplier)) {
+        let state = if risk.halted().is_some() { StrategyState::Disarmed } else { StrategyState::Failed };
+        return t.set(state, format!("Entry not sent: {e}"));
+    }
+
+    let (filled, fill) = match enter(&client, &opt, spec.quantity, &mut t, &mut cmds, &mut halt).await {
         Ok(v) => v,
         Err(EntryFailure::NotFilled(e)) => return t.set(StrategyState::Failed, e),
         Err(EntryFailure::Unknown { filled, message }) => {
@@ -358,17 +380,32 @@ fn is_last(tick: &TickType) -> bool {
     matches!(tick, TickType::Last | TickType::DelayedLast)
 }
 
-/// Ok(true) = fired, Ok(false) = disarmed.
+enum TriggerEnd {
+    /// With the option's latest ask, for the entry's cost check.
+    Fired { ask: Option<f64> },
+    Disarmed(String),
+}
+
 async fn wait_for_trigger(
     client: &Client,
     trigger: &Trigger,
+    opt: &ResolvedContract,
     allow_delayed: bool,
     t: &mut Tracker,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
-) -> Result<bool, String> {
+    halt: &mut watch::Receiver<Option<String>>,
+) -> Result<TriggerEnd, String> {
+    if let Some(reason) = halt.borrow_and_update().clone() {
+        return Ok(TriggerEnd::Disarmed(format!("Trading halted: {reason}")));
+    }
     let symbol = trigger.underlying.trim().to_uppercase();
     let contract = ibapi::contracts::Contract::stock(symbol.clone()).build();
     let mut sub = client.market_data(&contract).subscribe().await.map_err(describe)?.filter_data();
+    // The option's ask, kept current so the cost check at the trigger doesn't wait for a
+    // quote. If this stream fails, the entry falls back to a snapshot.
+    let mut asks = client.market_data(&opt.contract).subscribe().await.ok().map(|s| s.filter_data());
+    let mut ask: Option<f64> = None;
+    let mut halt_open = true;
     let watching = format!(
         "Watching {symbol} {} {}",
         if trigger.direction == TriggerDirection::RisesTo { "≥" } else { "≤" },
@@ -382,7 +419,22 @@ async fn wait_for_trigger(
             cmd = cmds.recv() => match cmd {
                 Some(Cmd::CloseNow) => continue,
                 // Disarm, or the handle was dropped.
-                Some(Cmd::Disarm) | None => return Ok(false),
+                Some(Cmd::Disarm) | None => return Ok(TriggerEnd::Disarmed("Disarmed before trigger".into())),
+            },
+            changed = halt.changed(), if halt_open => {
+                if changed.is_err() {
+                    halt_open = false;
+                } else if let Some(reason) = halt.borrow_and_update().clone() {
+                    return Ok(TriggerEnd::Disarmed(format!("Trading halted: {reason}")));
+                }
+            },
+            tick = async { asks.as_mut()?.next().await }, if asks.is_some() => match tick {
+                Some(Ok(tick)) => {
+                    if let Some(a) = ask_of(&tick) {
+                        ask = Some(a);
+                    }
+                }
+                _ => asks = None,
             },
             item = sub.next() => {
                 let tick = match item {
@@ -425,7 +477,7 @@ async fn wait_for_trigger(
                 }
                 if trigger_hit(trigger, last) {
                     t.u.message = format!("Triggered: {symbol} last {last}");
-                    return Ok(true);
+                    return Ok(TriggerEnd::Fired { ask });
                 }
                 if t.u.state != StrategyState::Armed {
                     t.set(StrategyState::Armed, watching.clone());
@@ -452,6 +504,7 @@ async fn enter(
     quantity: f64,
     t: &mut Tracker,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
+    halt: &mut watch::Receiver<Option<String>>,
 ) -> Result<(f64, f64), EntryFailure> {
     let order_id = client.next_order_id();
     let mut order = order_builder::market_order(Action::Buy, quantity);
@@ -472,8 +525,20 @@ async fn enter(
     let mut filled = 0.0;
     let mut avg: Option<f64> = None;
     let mut cmds_open = true;
+    let mut halt_open = true;
     loop {
         tokio::select! {
+            // A halt cancels the entry like Disarm; any partial fill is still protected.
+            changed = halt.changed(), if halt_open => {
+                if changed.is_err() {
+                    halt_open = false;
+                } else if halt.borrow_and_update().is_some() {
+                    halt_open = false;
+                    let _ = client.cancel_order(order_id, "").await;
+                    t.u.message = "Trading halted: cancelling entry…".into();
+                    t.emit();
+                }
+            },
             cmd = cmds.recv(), if cmds_open => match cmd {
                 Some(Cmd::Disarm) => {
                     // Cancel the working entry; any partial fill is protected below. The

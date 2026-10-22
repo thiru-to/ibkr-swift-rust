@@ -3,10 +3,12 @@
 mod options;
 mod orders;
 mod position;
+mod risk;
 mod session;
 mod strategy;
 mod types;
 
+pub use risk::RiskListener;
 pub use session::*;
 pub use strategy::{StrategyHandle, StrategyListener};
 pub use types::*;

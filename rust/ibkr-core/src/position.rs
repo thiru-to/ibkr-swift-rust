@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use ibapi::Client;
 use ibapi::accounts::PositionUpdate;
+use ibapi::contracts::{Contract, SecurityType};
 use ibapi::orders::{Action, CancelOrder, OcaType, Order, OrderData, Orders, order_builder};
 use ibapi::subscriptions::{SubscriptionItem, SubscriptionItemStreamExt};
 
@@ -50,7 +51,7 @@ impl Ctx<'_> {
 }
 
 /// Every working order IB reports (all clients), optionally for one contract.
-async fn working_orders(client: &Client, contract_id: Option<i32>) -> Result<Vec<OrderData>, IbkrError> {
+pub(crate) async fn working_orders(client: &Client, contract_id: Option<i32>) -> Result<Vec<OrderData>, IbkrError> {
     let mut sub = client.all_open_orders().await?.filter_data();
     // The same order can be reported more than once; keep the latest.
     let mut found: HashMap<(i32, i32, i64), OrderData> = HashMap::new();
@@ -74,12 +75,21 @@ async fn working_orders(client: &Client, contract_id: Option<i32>) -> Result<Vec
 
 /// The account's current position in the contract, straight from IB (0 if flat).
 async fn current_position(client: &Client, account: &str, contract_id: i32) -> Result<f64, IbkrError> {
+    position_where(client, account, |c| c.contract_id == contract_id).await
+}
+
+/// The account's current stock position in `symbol`, straight from IB (0 if flat).
+pub(crate) async fn stock_position(client: &Client, account: &str, symbol: &str) -> Result<f64, IbkrError> {
+    position_where(client, account, |c| c.security_type == SecurityType::Stock && c.symbol == symbol).await
+}
+
+async fn position_where(client: &Client, account: &str, matches: impl Fn(&Contract) -> bool) -> Result<f64, IbkrError> {
     let mut sub = client.positions().await?.filter_data();
     let mut quantity = 0.0;
     let read = async {
         while let Some(item) = sub.next().await {
             match item? {
-                PositionUpdate::Position(p) if p.account == account && p.contract.contract_id == contract_id => quantity = p.position,
+                PositionUpdate::Position(p) if p.account == account && matches(&p.contract) => quantity = p.position,
                 PositionUpdate::Position(_) => {}
                 PositionUpdate::PositionEnd => return Ok(()),
             }

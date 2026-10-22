@@ -17,6 +17,16 @@ impl PositionsListener for Positions {
     }
 }
 
+struct Risk;
+impl RiskListener for Risk {
+    fn on_risk(&self, s: RiskStatus) {
+        println!("risk: {s:?}");
+    }
+    fn on_error(&self, m: String) {
+        eprintln!("risk error: {m}");
+    }
+}
+
 struct Quotes;
 impl QuoteListener for Quotes {
     fn on_quote(&self, q: Quote) {
@@ -59,6 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("history {range:?}/{interval:?} error: {e}"),
         }
     }
+
+    // The risk guard's state goes to a temp file, so this never touches the app's limits.
+    let risk_path = std::env::temp_dir().join(format!("ibkr-smoke-risk-{}.json", session.account()));
+    let _risk = session.start_risk(risk_path.to_string_lossy().into(), Arc::new(Risk));
 
     let _quote = session.subscribe_quote(symbol, Arc::new(Quotes));
     std::thread::sleep(Duration::from_secs(5));

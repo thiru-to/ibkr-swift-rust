@@ -3,6 +3,7 @@
 //  IBKR Swift
 //
 
+import IbkrCore
 import SwiftUI
 
 struct ConnectionBar: ToolbarContent {
@@ -19,6 +20,12 @@ struct ConnectionBar: ToolbarContent {
                     .help(store.linkProblem ?? "Connected to IB Gateway")
                 ModeBadge(isLive: store.isLive)
                 Text(store.account).monospaced().foregroundStyle(.secondary)
+                if store.risk?.halted != nil {
+                    Pill(text: "HALTED", color: .red, solid: true)
+                        .help(store.risk?.halted ?? "")
+                } else {
+                    HaltButton()
+                }
                 Button("Disconnect", systemImage: "bolt.slash") {
                     if store.appDependentStrategies > 0 {
                         confirmDisconnect = true

@@ -231,6 +231,12 @@ private struct OrderConfirmSheet: View {
             if let placement {
                 PlacementResult(placement: placement)
             } else {
+                if let riskProblem {
+                    Label(riskProblem, systemImage: "hand.raised.fill")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .card(padding: 10)
+                }
                 let warnings = OrderCheck.warnings(request, quote, netLiquidation: store.summary?.netLiquidation)
                 if !warnings.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
@@ -251,6 +257,7 @@ private struct OrderConfirmSheet: View {
                     Button(store.isLive ? "Submit LIVE Order" : "Submit Paper Order") { submit() }
                         .buttonStyle(.borderedProminent)
                         .tint(store.isLive ? .red : .accentColor)
+                        .disabled(request.side == .buy && riskProblem != nil)
                 } else {
                     Button("Done") { dismiss() }
                         .keyboardShortcut(.defaultAction)
@@ -265,6 +272,15 @@ private struct OrderConfirmSheet: View {
     private var isSending: Bool {
         if case .sending = placement?.state { return true }
         return false
+    }
+
+    /// Buys are checked against the risk limits; while halted, sells may only close a long
+    /// (the Rust side checks the shares held).
+    private var riskProblem: String? {
+        if request.side == .sell {
+            return store.risk?.halted.map { _ in "Trading is halted: this sell is only allowed up to the shares you hold." }
+        }
+        return store.entryProblem(cost: OrderCheck.estimatedValue(request, quote))
     }
 
     private func submit() {

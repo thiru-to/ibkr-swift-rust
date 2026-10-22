@@ -79,6 +79,8 @@ final class AppStore {
     private(set) var positionQuote: Quote?
     private(set) var toasts: [Toast] = []
     var lastError: String?
+    /// The risk guard's limits, halt and daily P&L; nil until it starts.
+    private(set) var risk: RiskStatus?
 
     // Options
     private(set) var chain: OptionChain?
@@ -208,6 +210,7 @@ final class AppStore {
         watchedContract = nil
         orders = []
         orderMemory = nil
+        risk = nil
         lastPlacement = nil
         chain = nil
         underlyingQuote = nil
@@ -223,6 +226,10 @@ final class AppStore {
         })
         streams["positions"] = session.subscribePositions(listener: PositionsSink(
             update: { [weak self] in self?.positions = $0 },
+            fail: { [weak self] in self?.lastError = $0 }
+        ))
+        streams["risk"] = session.startRisk(statePath: Self.riskStatePath(account: account), listener: RiskSink(
+            update: { [weak self] in self?.riskChanged($0) },
             fail: { [weak self] in self?.lastError = $0 }
         ))
         refreshOrders()
@@ -282,6 +289,56 @@ final class AppStore {
                 post(Toast(title: rejected ? "Rejected" : "Cancelled", detail: what + reason, tone: rejected ? .failure : .info))
             }
         }
+    }
+
+    // MARK: Risk
+
+    /// Saved per account, so a halt survives restarts and paper and live keep separate limits.
+    private static func riskStatePath(account: String) -> String {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return dir.appending(path: "Risk/\(account).json").path(percentEncoded: false)
+    }
+
+    private func riskChanged(_ status: RiskStatus) {
+        // The guard reports once more as it stops; ignore that after disconnecting.
+        guard connection == .connected else { return }
+        if risk?.halted == nil, let reason = status.halted {
+            post(Toast(title: "Trading halted", detail: "\(reason). New entries are blocked for today; exits still work.", tone: .failure))
+        }
+        risk = status
+    }
+
+    /// Tighter limits apply now; looser ones from the next trading day.
+    func setRiskLimits(_ limits: RiskLimits) throws(ActionError) {
+        guard let session else { throw ActionError("Not connected") }
+        do {
+            risk = try session.setRiskLimits(limits: limits)
+        } catch {
+            throw ActionError(message(error))
+        }
+    }
+
+    /// Kill switch for the rest of the trading day. Strategies that haven't bought are
+    /// disarmed, entries in flight and this connection's buy orders are cancelled.
+    func haltTrading() {
+        session?.haltTrading(reason: "Halted manually")
+    }
+
+    /// Why the guard would refuse an opening order costing `cost` (nil = unknown). The
+    /// Rust side checks again right before sending; this is for immediate feedback.
+    func entryProblem(cost: Double?) -> String? {
+        guard let risk else { return isLive ? "Risk controls aren't running yet." : nil }
+        if let reason = risk.halted { return "Trading is halted for today (\(reason))." }
+        if isLive && !risk.running { return "Risk controls aren't running, so opening orders are refused on live accounts." }
+        if let max = risk.limits.maxDailyLoss {
+            guard let pnl = risk.dailyPnl else { return "Waiting for IB's daily P&L." }
+            if pnl <= -max { return "Daily loss limit reached." }
+        }
+        if let max = risk.limits.maxCostPerTrade {
+            guard let cost else { return "No price yet to check against the max cost per trade (\(Optional(max).money("USD")))." }
+            if cost > max { return "Est. cost \(Optional(cost).money("USD")) is above the max cost per trade (\(Optional(max).money("USD")))." }
+        }
+        return nil
     }
 
     // MARK: Toasts
@@ -657,6 +714,20 @@ private nonisolated final class ConnectionSink: ConnectionListener {
     }
 
     func onLink(status: LinkStatus, message: String) { onMain { self.update(status, message) } }
+}
+
+private nonisolated final class RiskSink: RiskListener {
+    let update: @MainActor @Sendable (RiskStatus) -> Void
+    let fail: @MainActor @Sendable (String) -> Void
+
+    init(update: @escaping @MainActor @Sendable (RiskStatus) -> Void,
+         fail: @escaping @MainActor @Sendable (String) -> Void) {
+        self.update = update
+        self.fail = fail
+    }
+
+    func onRisk(status: RiskStatus) { onMain { self.update(status) } }
+    func onError(message: String) { onMain { self.fail(message) } }
 }
 
 private nonisolated final class OrdersSink: OrdersListener {

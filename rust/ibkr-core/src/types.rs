@@ -317,3 +317,28 @@ pub struct StrategyUpdate {
     /// fired, entry in flight, or the EOD close is app-managed).
     pub requires_app: bool,
 }
+
+/// Account risk limits. Each is off when None. Only opening orders are checked against them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct RiskLimits {
+    /// Halt trading for the day once IB's daily P&L for the account reaches −this amount.
+    pub max_daily_loss: Option<f64>,
+    /// Refuse an entry whose estimated cost (ask × quantity × multiplier) is above this.
+    pub max_cost_per_trade: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RiskStatus {
+    /// The US/Eastern trading day the status is for, "YYYYMMDD".
+    pub trading_day: String,
+    pub limits: RiskLimits,
+    /// Looser limits that take effect next trading day (loosening never applies same-day).
+    pub pending: Option<RiskLimits>,
+    /// Why trading is halted for the rest of the day; None when it isn't.
+    pub halted: Option<String>,
+    /// IB's daily P&L for the account; None until a current reading arrives (or after the
+    /// stream drops).
+    pub daily_pnl: Option<f64>,
+    /// The guard is running for this session. Live sessions refuse entries without it.
+    pub running: bool,
+}

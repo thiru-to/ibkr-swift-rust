@@ -20,6 +20,7 @@ The trading logic is a Rust core built on the [`ibapi`](https://crates.io/crates
   - A **P/L simulator** charts estimated P/L against the underlying's price at a chosen time and at expiry (Black-Scholes at the option's implied volatility). It's an estimate only and never places orders.
   - Running strategies show their state (armed, entering, protected, closing, closed) and can be disarmed or closed now.
 - **Orders**: a stock order ticket (buy/sell, market or limit, Day or GTC) with price sanity checks, and today's orders from every client (including ones placed in TWS), filterable by status. Cancel works on orders this connection placed. Toasts announce fills, partial fills, cancels and rejections.
+- **Risk controls** (Account screen): a max daily loss (from IB's daily P&L for the account) and a max cost per trade. Hitting the loss limit, or pressing **Halt Trading** in the toolbar, blocks new entries for the rest of the trading day, even across restarts. It also disarms armed strategies and cancels entry orders that are still working. Exits are never blocked. Tighter limits apply immediately; looser ones from the next trading day.
 - **Connection**: connects automatically at launch and keeps retrying until Gateway is up. It recovers after Gateway drops and reconnects.
 
 ### Safety rails
@@ -27,6 +28,7 @@ The trading logic is a Rust core built on the [`ibapi`](https://crates.io/crates
 - Every order, position action and strategy arm goes through a review step showing the account and **LIVE / PAPER**. There's no Return shortcut on the final button.
 - The app treats a session as live if the mode is Live, the port is a live port (4001 / 7496), *or* the account id isn't a paper id (`DU…`). A mismatch shows a warning.
 - On live sessions, strategy triggers never fire on delayed market data.
+- Risk limits fail closed: with a loss limit set, nothing opens until IB's daily P&L is in, and live sessions refuse entries if the risk guard isn't running. A halt only stops this app; orders placed in TWS or on mobile aren't affected.
 - The Rust core re-checks position actions against IB before sending (quantity unchanged, no conflicting working orders from other clients).
 - Quitting while a strategy still depends on the app (trigger not fired yet, entry in flight) asks for confirmation. Protected positions keep their exit orders at IB.
 
@@ -78,8 +80,12 @@ If `xcodebuild` complains about the Command Line Tools, point `DEVELOPER_DIR` at
 ```sh
 cd rust
 
-# Read-only: connects, prints the account summary, positions, price history and live quotes. Never places orders.
+# Read-only: connects, prints the account summary, positions, price history, risk status and live quotes. Never places orders.
 cargo run --example smoke                 # [port] [symbol], defaults 4002 AAPL; pass 4001 for live
+
+# Paper only, places nothing: arms a strategy that can't trigger, halts trading, and checks
+# that the strategy is disarmed and new entries are refused.
+cargo run --example strategy_paper -- halt
 
 # PAPER ONLY: arms a real strategy (1 SPY 0DTE ATM call, TP +50%, SL -30%, EOD 15:50),
 # waits until it's protected, then closes it. Refuses live ports and non-paper accounts.
@@ -114,6 +120,7 @@ rust/ibkr-core/src/
   options.rs                chains, contract resolution, tick rounding
   orders.rs                 order book behind the Orders screen
   position.rs               close / protect / modify for positions
+  risk.rs                   risk limits, daily-loss halt and kill switch
   types.rs                  types shared with Swift
 rust/ibkr-core/examples/    smoke (read-only) and strategy_paper (paper-only) checks
 scripts/build-rust.sh       builds Rust, generates bindings, assembles the xcframework

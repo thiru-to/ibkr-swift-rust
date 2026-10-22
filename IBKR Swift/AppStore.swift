@@ -17,9 +17,25 @@ final class AppStore {
         case disconnected, connecting, connected
     }
 
-    // Connection settings. 4001 = Gateway live, 4002 = Gateway paper.
+    enum TradingMode: String, CaseIterable, Identifiable {
+        case live, paper
+
+        var id: Self { self }
+        var title: String { self == .live ? "Live" : "Paper" }
+        /// IB Gateway defaults.
+        var defaultPort: Int { self == .live ? 4001 : 4002 }
+    }
+
+    /// Selecting a mode sets the port; the choice is remembered across launches.
+    var mode: TradingMode {
+        didSet {
+            port = mode.defaultPort
+            UserDefaults.standard.set(mode.rawValue, forKey: "tradingMode")
+        }
+    }
+
     var host = "127.0.0.1"
-    var port = 4001
+    var port: Int
     var clientId = 1
 
     private(set) var connection = Connection.disconnected
@@ -35,6 +51,12 @@ final class AppStore {
     @ObservationIgnored private var session: IbkrSession?
     @ObservationIgnored private var streams: [String: StreamHandle] = [:]
 
+    init() {
+        let mode = UserDefaults.standard.string(forKey: "tradingMode").flatMap(TradingMode.init) ?? .paper
+        self.mode = mode
+        self.port = mode.defaultPort
+    }
+
     // MARK: Connection
 
     func connect() async {
@@ -45,7 +67,13 @@ final class AppStore {
             let session = try await IbkrCore.connect(host: host, port: port, clientId: Int32(clientId))
             self.session = session
             account = session.account()
-            isLive = session.isLive()
+            // IB paper account ids start with "D" (e.g. DU1234567). Treat the session as
+            // live if anything says so: the selected mode, the port, or the account id.
+            let liveAccount = !account.hasPrefix("D")
+            isLive = mode == .live || session.isLive() || liveAccount
+            if mode == .paper && isLive {
+                lastError = "Paper mode is selected, but Gateway reports a live account (\(account)). Orders will use real money."
+            }
             connection = .connected
             startStreams(session)
             await refreshSummary()

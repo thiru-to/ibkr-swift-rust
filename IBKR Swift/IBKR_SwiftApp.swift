@@ -18,5 +18,21 @@ struct IBKR_SwiftApp: App {
                 .frame(minWidth: 820, minHeight: 520)
         }
         .defaultSize(width: 1000, height: 640)
+        .commands {
+            CommandMenu("Account") {
+                @Bindable var store = store
+                Picker("Trading Mode", selection: $store.mode) {
+                    ForEach(AppStore.TradingMode.allCases) { mode in
+                        Text("\(mode.title) (port \(String(mode.defaultPort)))").tag(mode)
+                    }
+                }
+                .pickerStyle(.inline)
+                .disabled(store.connection != .disconnected)
+
+                if store.connection != .disconnected {
+                    Text("Disconnect to change mode")
+                }
+            }
+        }
     }
 }

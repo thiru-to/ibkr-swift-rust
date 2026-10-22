@@ -6,7 +6,8 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 
 ## Safety
 
-- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. `IbkrSession::is_live()` treats 4001 and 7496 as live.
+- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account** menu selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper.
+- `AppStore.isLive` is deliberately conservative: it's true if the mode is Live, *or* the port is a live port (`IbkrSession::is_live()`: 4001 or 7496), *or* the account id doesn't start with `D` (IB paper ids look like `DU…`). A Paper/live mismatch shows a warning.
 - Every order submit in `OrdersView.swift` goes through a confirmation dialog that shows the account and LIVE/PAPER. Keep that step.
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
 

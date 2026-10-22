@@ -18,6 +18,8 @@ struct ConnectionBar: ToolbarContent {
                     Task { await store.disconnect() }
                 }
             } else {
+                ModeBadge(isLive: store.mode == .live)
+                    .help("Change in the Account menu")
                 TextField("Host", text: $store.host).frame(width: 110)
                 TextField("Port", value: $store.port, format: .number.grouping(.never)).frame(width: 60)
                 TextField("Client ID", value: $store.clientId, format: .number.grouping(.never)).frame(width: 50)

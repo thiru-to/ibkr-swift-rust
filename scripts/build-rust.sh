@@ -3,7 +3,8 @@
 #   IbkrCore/Sources/IbkrCore/IbkrCore.swift   (UniFFI bindings)
 #   IbkrCore/IbkrCoreFFI.xcframework           (static lib + C header + modulemap)
 # Run by the "IBKR Swift" scheme's build pre-action; safe to run by hand.
-# CONFIGURATION=Debug uses cargo's dev profile; anything else builds release.
+# Always builds cargo's release profile: scheme pre-actions don't reliably see the
+# configuration being built, and an incremental release build only takes a few seconds.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,15 +20,9 @@ rm -f "$FAILED"
 
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
-if [ "${CONFIGURATION:-Release}" = "Debug" ]; then
-  PROFILE_FLAG=(); PROFILE_DIR=debug
-else
-  PROFILE_FLAG=(--release); PROFILE_DIR=release
-fi
-
 cd "$RUST"
-cargo build -p ibkr-core --lib --target "$TARGET" ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"}
-LIB="$RUST/target/$TARGET/$PROFILE_DIR/libibkr_core.a"
+cargo build -p ibkr-core --lib --release --target "$TARGET"
+LIB="$RUST/target/$TARGET/release/libibkr_core.a"
 
 # cargo is incremental; skip regeneration when the library hasn't changed.
 STAMP="$XCF/.source"
@@ -83,4 +78,4 @@ cat > "$XCF/Info.plist" <<'PLIST'
 </plist>
 PLIST
 echo "$LIB" > "$STAMP"
-echo "IbkrCore bindings regenerated ($PROFILE_DIR)"
+echo "IbkrCore bindings regenerated"

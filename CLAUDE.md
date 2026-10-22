@@ -24,8 +24,9 @@ cargo test -p ibkr-core coalesces   # a single test by name
 cargo clippy --all-targets
 cargo run --example smoke -- 4001 AAPL   # read-only check against the running Gateway
 
-# Regenerate Swift bindings + xcframework (normally done automatically by the scheme)
-CONFIGURATION=Debug scripts/build-rust.sh
+# Regenerate Swift bindings + xcframework (normally done automatically by the scheme;
+# always builds Rust in release, since pre-actions don't reliably see the configuration)
+scripts/build-rust.sh
 
 # App
 xcodebuild -project "IBKR Swift.xcodeproj" -scheme "IBKR Swift" -configuration Debug build

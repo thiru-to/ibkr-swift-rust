@@ -70,8 +70,9 @@ One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDela
 - **Exit prices come from the actual average fill**, rounded with the contract's IB market rule (price bands) via `options::round_to_tick`. Take-profit rounds up and the stop rounds down, floored at one tick. `$` targets are for the whole position (÷ qty × multiplier).
 - **OCA siblings get cancelled when one exit fills**, and those cancels can arrive before the fill. Only report Unprotected when every exit is cancelled without a fill.
 - **Dropping a `StrategyHandle` before entry disarms it** (the command channel closes). During entry, it does *not* cancel the entry.
+- **`resolve_option` trims the expiry date.** `contract_details` returns `last_trade_date_or_contract_month` as "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (error 10372), so it's cut down to YYYYMMDD.
 - **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
-- **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
+- **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Both runs passed on 2026-10-22, and IB accepted the time-conditioned EOD order inside the OCA group. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
 
 ## Build pipeline gotchas
 

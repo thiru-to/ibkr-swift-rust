@@ -88,6 +88,12 @@ pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<Resolv
             message: format!("no {symbol} {:?} {} expiring {}", spec.right, spec.strike, spec.expiry),
         })?;
 
+    // contract_details returns "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (10372).
+    let mut contract = d.contract.clone();
+    if let Some(date) = contract.last_trade_date_or_contract_month.split_whitespace().next() {
+        contract.last_trade_date_or_contract_month = date.to_string();
+    }
+
     let multiplier = d.contract.multiplier.parse().unwrap_or(100.0);
     let mut increments = vec![(0.0, if d.min_tick > 0.0 { d.min_tick } else { 0.01 })];
     // market_rule_ids line up with valid exchanges; IB uses one rule for SMART-routed US options.
@@ -101,7 +107,7 @@ pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<Resolv
 
     Ok(ResolvedOption {
         local_symbol: d.contract.local_symbol.clone(),
-        contract: d.contract.clone(),
+        contract,
         multiplier,
         increments,
     })

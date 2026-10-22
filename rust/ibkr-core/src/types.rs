@@ -92,6 +92,7 @@ pub struct OpenOrder {
     pub quantity: f64,
     pub filled: f64,
     pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
     pub status: String,
 }
 

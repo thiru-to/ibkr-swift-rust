@@ -446,7 +446,9 @@ fn upsert_order(book: &mut BTreeMap<i32, OpenOrder>, d: OrderData) {
             order_type: d.order.order_type.clone(),
             quantity: d.order.total_quantity,
             filled,
-            limit_price: d.order.limit_price,
+            // IB reports 0 for "not set".
+            limit_price: d.order.limit_price.filter(|p| *p > 0.0),
+            stop_price: d.order.aux_price.filter(|p| *p > 0.0),
             status: format!("{:?}", d.order_state.status),
         },
     );

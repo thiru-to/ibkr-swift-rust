@@ -631,7 +631,8 @@ async fn protect_and_monitor(
                         OrderStatusKind::Filled => {
                             let exit = s.average_fill_price.unwrap_or(0.0);
                             t.u.exit_price = Some(exit);
-                            t.u.realized_pnl = Some((exit - fill) * quantity * opt.multiplier);
+                            let pnl = (exit - fill) * quantity * opt.multiplier;
+                            t.u.realized_pnl = Some((pnl * 100.0).round() / 100.0);
                             return t.set(StrategyState::Closed, format!("Closed by {kind} @ {exit}"));
                         }
                         // OCA siblings are cancelled when one exit fills, and those

@@ -119,6 +119,7 @@ struct OpenOrdersView: View {
             TableColumn("Type", value: \.orderType).width(50)
             TableColumn("Qty") { o in Text("\(o.filled.quantity)/\(o.quantity.quantity)") }
             TableColumn("Limit") { o in Text(o.limitPrice.formatted()) }
+            TableColumn("Stop") { o in Text(o.stopPrice.formatted()) }
             TableColumn("Status", value: \.status)
             TableColumn("") { o in
                 Button("Cancel") { Task { await store.cancelOrder(o.orderId) } }

@@ -45,6 +45,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => println!("no positions snapshot within 5s"),
     }
 
+    for (range, interval) in [(ChartRange::Day, BarInterval::Min1), (ChartRange::Week, BarInterval::Hour4), (ChartRange::Year, BarInterval::Day1)] {
+        match rt.block_on(session.price_history(symbol.clone(), range, interval, None)) {
+            Ok(bars) => {
+                println!("history {range:?}/{interval:?}: {} bars, last {:?}", bars.len(), bars.last());
+                // The page before it, as the chart loads when panning back.
+                let end = bars.first().map(|b| b.time);
+                match rt.block_on(session.price_history(symbol.clone(), range, interval, end)) {
+                    Ok(older) => println!("  older page: {} bars, {:?} .. {:?}", older.len(), older.first().map(|b| b.time), older.last().map(|b| b.time)),
+                    Err(e) => eprintln!("  older page error: {e}"),
+                }
+            }
+            Err(e) => eprintln!("history {range:?}/{interval:?} error: {e}"),
+        }
+    }
+
     let _quote = session.subscribe_quote(symbol, Arc::new(Quotes));
     std::thread::sleep(Duration::from_secs(5));
 

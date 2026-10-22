@@ -13,6 +13,10 @@ struct ConnectionBar: ToolbarContent {
         @Bindable var store = store
         ToolbarItemGroup(placement: .primaryAction) {
             if store.connection == .connected {
+                Circle()
+                    .fill(store.linkProblem == nil ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                    .help(store.linkProblem ?? "Connected to IB Gateway")
                 ModeBadge(isLive: store.isLive)
                 Text(store.account).monospaced().foregroundStyle(.secondary)
                 Button("Disconnect", systemImage: "bolt.slash") {
@@ -49,11 +53,6 @@ struct ModeBadge: View {
     let isLive: Bool
 
     var body: some View {
-        Text(isLive ? "LIVE" : "PAPER")
-            .font(.caption.bold())
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(isLive ? Color.red : Color.green, in: Capsule())
-            .foregroundStyle(.white)
+        Pill(text: isLive ? "LIVE" : "PAPER", color: isLive ? .red : .green, solid: true)
     }
 }

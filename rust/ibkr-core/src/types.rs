@@ -39,7 +39,10 @@ pub struct Position {
     pub local_symbol: String,
     pub currency: String,
     pub quantity: f64,
+    /// Per unit, including the multiplier (an option's is per contract, i.e. price × 100).
     pub average_cost: f64,
+    /// Contract multiplier: 1 for stocks, usually 100 for options.
+    pub multiplier: f64,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -54,6 +57,39 @@ pub struct Quote {
     pub volume: Option<f64>,
     /// True when IB is serving delayed (non-subscribed) data.
     pub delayed: bool,
+}
+
+/// One historical price bar (trades).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PriceBar {
+    /// Bar start, unix seconds. Daily bars use noon UTC of the trading day.
+    pub time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+/// How far back a price chart reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ChartRange {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+/// Bar size for a price chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum BarInterval {
+    Min1,
+    Min2,
+    Min5,
+    Min15,
+    Hour1,
+    Hour4,
+    Day1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -83,6 +119,28 @@ pub struct OrderRequest {
     pub tif: TimeInForce,
 }
 
+/// IB's first answer to a placed order. Rejections are returned as errors instead.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PlacedOrder {
+    pub order_id: i32,
+    /// IB's status ("PreSubmitted", "Submitted", "Filled"…), or "Sent" if IB hadn't
+    /// answered within the wait; the Orders list keeps tracking it either way.
+    pub status: String,
+    /// IB warnings about the order (e.g. held until the market opens), or empty.
+    pub message: String,
+}
+
+/// The API socket and Gateway's own link to IB's servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LinkStatus {
+    /// Orders and data are not flowing; ibapi is reconnecting.
+    Lost,
+    /// Back up; subscriptions survived.
+    Restored,
+    /// Back up, but market-data subscriptions were lost and must be re-requested.
+    RestoredDataLost,
+}
+
 /// Coarse grouping of IB's order statuses, for filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum OrderStatusGroup {
@@ -103,6 +161,9 @@ pub struct OrderInfo {
     pub order_id: i32,
     /// IB's permanent id (unique across clients); 0 until IB assigns it.
     pub perm_id: i64,
+    /// API client that placed it (0 for TWS). Order ids are only unique per client.
+    pub client_id: i32,
+    pub contract_id: i32,
     pub account: String,
     pub symbol: String,
     /// IB's full contract name, e.g. "SPY   261022C00763000".
@@ -234,9 +295,13 @@ pub struct StrategyUpdate {
     pub state: StrategyState,
     pub message: String,
     pub option_local_symbol: String,
+    /// IB's contract id for the option, once resolved (0 before), to match positions.
+    pub contract_id: i32,
     pub underlying_last: Option<f64>,
     pub underlying_delayed: bool,
     pub entry_order_id: Option<i32>,
+    /// Every exit order placed so far (take-profit, stop, EOD, close-now).
+    pub exit_order_ids: Vec<i32>,
     pub filled_quantity: f64,
     pub average_fill: Option<f64>,
     pub take_profit_price: Option<f64>,
@@ -246,6 +311,8 @@ pub struct StrategyUpdate {
     pub eod_close_at: Option<String>,
     pub exit_price: Option<f64>,
     pub realized_pnl: Option<f64>,
+    /// `close_now` will act: the position is filled and its exits are being tracked.
+    pub can_close: bool,
     /// The app must stay open and connected for this strategy to work (trigger not yet
     /// fired, entry in flight, or the EOD close is app-managed).
     pub requires_app: bool,

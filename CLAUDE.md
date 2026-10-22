@@ -8,7 +8,8 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 
 - **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account** menu selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper.
 - `AppStore.isLive` is deliberately conservative: it's true if the mode is Live, *or* the port is a live port (`IbkrSession::is_live()`: 4001 or 7496), *or* the account id doesn't start with `D` (IB paper ids look like `DU…`). A Paper/live mismatch shows a warning.
-- Every order submit in `OrdersView.swift` goes through a confirmation dialog that shows the account and LIVE/PAPER. Keep that step.
+- Every order submit in `OrdersView.swift` goes through a confirmation sheet (`OrderConfirmSheet`) that shows the account, LIVE/PAPER and price sanity warnings (`OrderCheck`). Keep that step, and keep the submit button free of a Return shortcut.
+- Position actions (`PositionDetailView.swift`: close, add stop/take-profit, edit a working order's price) also go through a review panel showing LIVE/PAPER, with no Return shortcut. Keep that.
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
 
 ## Commands
@@ -51,7 +52,8 @@ SwiftUI views (IBKR Swift/, MainActor by default)
   - Streams (positions, quote, orders) are spawned tasks that push **full snapshots** to a foreign listener trait (`PositionsListener`, `QuoteListener`, `OrdersListener`).
   - Every stream returns a `StreamHandle`. Calling `cancel()` or dropping it aborts the task, and dropping the `ibapi` subscription sends the IB-side cancel.
   - FFI types live in `types.rs`.
-- **Orders stream**: it opens `order_update_stream()` *before* seeding from `all_open_orders()`, so nothing placed during seeding is missed. It drops orders in terminal states (Filled, Cancelled, ApiCancelled, Inactive).
+- **Placing orders**: `place_order` uses `client.place_order` (not the builder's fire-and-forget `submit()`) and waits up to 5s for IB's first answer. A rejection (`ibapi::Error::Notice`) comes back as an error; no answer yet returns status "Sent". Dropping a `PlaceOrder` subscription does not cancel the order.
+- **Gateway drops**: ibapi reconnects by itself but fails every live subscription. The orders and positions streams rerun via `keep_streaming` once `is_connected()` is true again. `subscribe_connection` reports `LinkStatus` (socket loss is seen only by polling `is_connected()`; 1100/1101/1102 come as notices), and Swift re-requests quotes on `RestoredDataLost`.
 - **Market data**: `connect` calls `switch_market_data_type(Delayed)`. IB still serves live data when the account has a subscription, and the quote's `delayed` flag reports which one you got.
 - **Swift isolation**: the app target sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
   - The generated bindings therefore live in the separate `IbkrCore/` package, which uses default isolation and Swift 5 mode. Don't move them into the app target.
@@ -65,11 +67,16 @@ One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDela
 
 - **Delayed data never fires a trigger**, unless `allow_delayed` is set. `IbkrSession::arm_strategy` forces it off on live ports and on non-`D` accounts, and the UI hides the toggle on live.
 - **The trigger must be crossed after arming.** The first last-trade tick is a baseline, and arming fails if that baseline is already through the trigger.
-- **Every sell-to-close joins one OCA group (`CancelWithBlock`).** That covers take-profit, stop, the EOD close (a market order with an IB `TimeCondition`, "YYYYMMDD HH:MM:SS US/Eastern") and close-now. So at most one can fill, and none can open a short. Never place a closing order outside the group.
+- **Every sell-to-close joins one OCA group (`ReduceWithBlock`).** That covers take-profit, stop, the EOD close (a market order with an IB `TimeCondition`, "YYYYMMDD HH:MM:SS US/Eastern") and close-now. A fill on one shrinks the others by the same amount, so together they never sell more than the position and none can open a short. (`CancelWithBlock` cancelled the stop outright on a *partial* take-profit fill, leaving the rest unprotected.) Never place a closing order outside the group.
+  - Exit fills are summed across orders (`ExitFills`); the strategy is Closed only when the whole position is sold, and close-now sells only what's left.
+  - `place_exit` replays the statuses it read while checking acceptance, since a market close can report Filled first.
   - If IB rejects the time-conditioned EOD order, the task falls back to an app-side timer and sets `requires_app`.
 - **OCA group names must be unique for the whole account and day** (`oca_group_name`: nanosecond timestamp + entry order id). IB rejects every member of a group whose name has already filled ("OCA group is already filled"), and order ids and strategy ids restart per connection. A reused name once left a filled entry with no exits.
 - **Exit prices come from the actual average fill**, rounded with the contract's IB market rule (price bands) via `options::round_to_tick`. Take-profit rounds up and the stop rounds down, floored at one tick. `$` targets are for the whole position (÷ qty × multiplier).
-- **OCA siblings get cancelled when one exit fills**, and those cancels can arrive before the fill. Only report Unprotected when every exit is cancelled without a fill.
+- **OCA siblings get cancelled when the position is sold**, and those cancels can arrive before the fill. Only report Unprotected when every exit is cancelled without the whole position sold.
+- **Losing track of the entry is never "Failed".** Only an IB rejection or an unfilled terminal status is Failed; a dropped connection or ended stream reports Unprotected (the market order may still fill). `can_close` tells the UI whether `close_now` will act (only while exits are being monitored).
+- **Strategy orders are tracked through ibapi's per-order status taps (`order_status_stream`), never their `place_order` subscriptions.** ibapi keeps one route per order id and a later `place_order` / `cancel_order` on the same id *replaces* it, silently ending the earlier subscription. (Before the switch, the strategy's own "Cancel Entry" did this to its entry tracking.) Taps survive that, so exits can be cancelled or edited from elsewhere.
+- Running strategies register their order ids in `OwnedOrders` (removed when the task ends). Manual close / protect refuse positions with working orders in it: the UI closes those with the strategy's Close Now instead.
 - **Dropping a `StrategyHandle` before entry disarms it** (the command channel closes). During entry, it does *not* cancel the entry.
 - **`resolve_option` trims the expiry date.** `contract_details` returns `last_trade_date_or_contract_month` as "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (error 10372), so it's cut down to YYYYMMDD.
 - **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
@@ -81,7 +88,20 @@ The order list (the `orders` stream) keeps every order IB reports instead of dro
 
 - Orders are keyed by **perm id**, because completed orders placed outside the API carry order id 0 or -1. An order seen before IB assigns a perm id gets a provisional key, which migrates once the perm id arrives.
 - `OrderStatusGroup` buckets IB's statuses for the Orders screen filter: Open, Filled, Cancelled, Inactive and Other.
-- Completed orders report `total_quantity` 0 and can echo stale limit prices, which `upsert` normalizes.
+- Completed orders report `total_quantity` 0 and can echo stale limit prices, which `upsert` normalizes. They carry no fill price, so today's executions are seeded too (`apply_execution`, by perm id).
+- The update stream is read without `filter_data()`: order-bound notices carry IB's rejection reasons, which `Book::note` attaches to this client's order (or holds until it arrives). A status that arrives before its order is held too.
+- `OrderInfo.client_id`: order ids are only unique per client id, so the UI offers Cancel only for this connection's orders.
+- Swift toasts fills, partial fills, cancels and rejections by diffing snapshots (`AppStore.ordersChanged`); the first snapshot after connecting is the baseline.
+
+## Position actions (`rust/ibkr-core/src/position.rs`)
+
+- **Close**: a whole-position limit order at the capped price the user reviewed (bid − cap to sell, ask + cap to buy; defaults 5% options, 0.5% stocks), Day TIF.
+  - It refuses if TWS or another client has working orders on the contract.
+  - Otherwise it cancels this client's working orders there and waits for IB to confirm each cancel. It aborts if any of them filled meanwhile, since IB's position report can lag a fill.
+  - Then it re-reads the quantity from IB, which must equal what the user reviewed (`expected_quantity`).
+- **Protect**: take-profit and/or stop (optionally stop-limit), in one `ReduceWithBlock` OCA group, GTC. It's only allowed when the contract has no working orders; edit those instead.
+- **Modify**: only this connection's working orders. It re-sends the order as IB currently reports it (so an OCA-reduced quantity stays reduced) with the new limit/aux price, rounded to the nearest tick.
+- Contracts are resolved by conid with exchange SMART (`options::resolve_contract_id`). Stocks report no multiplier, so it defaults to 1. `Position.average_cost` includes the multiplier.
 
 ## Build pipeline gotchas
 
@@ -95,6 +115,6 @@ The order list (the `orders` stream) keeps every order IB reports instead of dro
 ## ibapi notes
 
 - The `ibapi` 5.x source is the best reference: `~/.cargo/registry/src/*/ibapi-5.*/examples/async/`.
-- The order builder is `client.order(&contract).buy(q).limit(px).time_in_force(..).submit()`, which returns an `OrderId` (`.value()` gives the i32).
+- The order builder is `client.order(&contract).buy(q).limit(px).time_in_force(..)`; `.build()` gives an `Order` for `client.place_order`. Its `.submit()` is fire-and-forget, so rejections never reach the caller: don't use it.
 - `cancel_order(id, "")` returns a subscription. The code waits up to 3s for the first reply so rejections surface as errors.
 - Gateway must have "Enable ActiveX and Socket Clients" on and 127.0.0.1 trusted. For orders, "Read-Only API" must be unchecked.

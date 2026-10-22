@@ -35,6 +35,7 @@ struct ContentView: View {
         NavigationSplitView {
             List(SidebarItem.allCases, selection: $selection) { item in
                 Label(item.rawValue, systemImage: item.icon)
+                    .badge(badge(item))
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
@@ -55,25 +56,35 @@ struct ContentView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .bottom) { ErrorBanner() }
+            .safeAreaInset(edge: .bottom) { Banners() }
+            .overlay(alignment: .topTrailing) { ToastStack() }
         }
         .toolbar { ConnectionBar() }
     }
+
+    /// Counts that need attention: working orders, running strategies.
+    private func badge(_ item: SidebarItem) -> Int {
+        guard store.connection == .connected else { return 0 }
+        switch item {
+        case .orders: return store.openOrderCount
+        case .options: return store.activeStrategyCount
+        default: return 0
+        }
+    }
 }
 
-private struct ErrorBanner: View {
+private struct Banners: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
-        if let error = store.lastError {
-            HStack {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(error).lineLimit(2).textSelection(.enabled)
-                Spacer()
-                Button("Dismiss") { store.lastError = nil }
+        VStack(spacing: 0) {
+            if let problem = store.linkProblem {
+                Banner(icon: "wifi.exclamationmark", tint: .orange,
+                       text: "\(problem) Orders and positions may be out of date until it's back.")
             }
-            .padding(10)
-            .background(.bar)
+            if let error = store.lastError {
+                Banner(icon: "exclamationmark.triangle.fill", tint: .red, text: error) { store.lastError = nil }
+            }
         }
     }
 }

@@ -456,6 +456,7 @@ dependencies = [
  "ibapi",
  "jiff",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "uniffi",
 ]

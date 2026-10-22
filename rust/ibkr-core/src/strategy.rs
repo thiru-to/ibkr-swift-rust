@@ -6,10 +6,15 @@
 //!   and arming fails if the baseline is already through the trigger.
 //! - The entry is sent at most once (the task only moves forward).
 //! - Every sell-to-close (take-profit, stop, EOD close, close-now) shares one OCA group with
-//!   CancelWithBlock, so at most one can fill and none can open a short.
+//!   ReduceWithBlock: a fill on one shrinks the others by the same amount, so together they
+//!   never sell more than the position and none can open a short.
+//! - Orders are tracked through ibapi's per-order status taps, not their `place_order`
+//!   subscriptions: a cancel or modify sent from elsewhere re-registers the order id and
+//!   would silently take a subscription's messages.
 
+use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -19,14 +24,14 @@ use ibapi::contracts::tick_types::TickType;
 use ibapi::market_data::MarketDataType;
 use ibapi::market_data::realtime::TickTypes;
 use ibapi::orders::conditions::TimeCondition;
-use ibapi::orders::{Action, OcaType, Order, OrderCondition, OrderStatusKind, PlaceOrder, order_builder};
+use ibapi::orders::{Action, OcaType, Order, OrderCondition, OrderStatus, OrderStatusKind, order_builder};
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use jiff::Zoned;
 use jiff::civil::Time;
 use jiff::tz::TimeZone;
 use tokio::sync::mpsc;
 
-use crate::options::{self, ResolvedOption, Round};
+use crate::options::{self, ResolvedContract, Round};
 use crate::types::*;
 
 #[uniffi::export(with_foreign)]
@@ -65,16 +70,21 @@ impl StrategyHandle {
     }
 }
 
+/// Order ids that running strategies placed. Closing or protecting a position by hand
+/// must not touch these (it would break the strategy's OCA group).
+pub(crate) type OwnedOrders = Arc<Mutex<HashSet<i32>>>;
+
 pub(crate) fn spawn(
     runtime: &tokio::runtime::Runtime,
     client: Arc<Client>,
     spec: StrategySpec,
     listener: Arc<dyn StrategyListener>,
+    owned: OwnedOrders,
 ) -> Arc<StrategyHandle> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime.spawn(run(client, id, spec, listener, rx));
+    runtime.spawn(run(client, id, spec, listener, rx, owned));
     Arc::new(StrategyHandle { id, cmds: tx })
 }
 
@@ -231,9 +241,24 @@ struct Tracker {
     listener: Arc<dyn StrategyListener>,
     /// IB refused the time-conditioned EOD order, so the app sends it.
     eod_by_app: bool,
+    owned: OwnedOrders,
+}
+
+/// The strategy's orders stop being "owned" when its task ends, however it ends.
+impl Drop for Tracker {
+    fn drop(&mut self) {
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        for id in self.u.entry_order_id.iter().chain(&self.u.exit_order_ids) {
+            owned.remove(id);
+        }
+    }
 }
 
 impl Tracker {
+    fn own(&self, order_id: i32) {
+        self.owned.lock().unwrap_or_else(|e| e.into_inner()).insert(order_id);
+    }
+
     fn emit(&mut self) {
         use StrategyState::*;
         self.u.requires_app = match self.u.state {
@@ -261,6 +286,7 @@ async fn run(
     spec: StrategySpec,
     listener: Arc<dyn StrategyListener>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    owned: OwnedOrders,
 ) {
     let mut t = Tracker {
         u: StrategyUpdate {
@@ -268,9 +294,11 @@ async fn run(
             state: StrategyState::Arming,
             message: "Resolving contract…".into(),
             option_local_symbol: format!("{} {} {:?} {}", spec.option.symbol, spec.option.expiry, spec.option.right, spec.option.strike),
+            contract_id: 0,
             underlying_last: None,
             underlying_delayed: false,
             entry_order_id: None,
+            exit_order_ids: Vec::new(),
             filled_quantity: 0.0,
             average_fill: None,
             take_profit_price: None,
@@ -279,10 +307,12 @@ async fn run(
             eod_close_at: None,
             exit_price: None,
             realized_pnl: None,
+            can_close: false,
             requires_app: true,
         },
         listener,
         eod_by_app: false,
+        owned,
     };
     t.emit();
 
@@ -297,6 +327,7 @@ async fn run(
         Err(e) => return t.set(StrategyState::Failed, describe(e)),
     };
     t.u.option_local_symbol = opt.local_symbol.clone();
+    t.u.contract_id = opt.contract.contract_id;
     let zero_dte = spec.option.expiry == now.strftime("%Y%m%d").to_string();
     let exit_tif = if zero_dte { ibapi::orders::TimeInForce::Day } else { ibapi::orders::TimeInForce::GoodTillCanceled };
 
@@ -310,8 +341,14 @@ async fn run(
 
     let (filled, fill) = match enter(&client, &opt, spec.quantity, &mut t, &mut cmds).await {
         Ok(v) => v,
-        Err((0.0, e)) => return t.set(StrategyState::Failed, e),
-        Err((filled, e)) => return t.set(StrategyState::Unprotected, format!("{filled} filled but entry tracking failed: {e}")),
+        Err(EntryFailure::NotFilled(e)) => return t.set(StrategyState::Failed, e),
+        Err(EntryFailure::Unknown { filled, message }) => {
+            let id = t.u.entry_order_id.unwrap_or_default();
+            return t.set(
+                StrategyState::Unprotected,
+                format!("Lost track of entry order #{id} ({message}) with {filled} filled. It may still fill and has no exits: check Orders and Positions."),
+            );
+        }
     };
 
     protect_and_monitor(&client, &opt, &spec, filled, fill, exit_tif, eod, &mut t, &mut cmds).await;
@@ -400,27 +437,37 @@ async fn wait_for_trigger(
     }
 }
 
-/// Market buy; returns (filled qty, average fill). Err carries any partial fill.
+enum EntryFailure {
+    /// IB refused it or it ended unfilled: nothing was bought.
+    NotFilled(String),
+    /// Tracking was lost (e.g. the Gateway connection dropped): the order may still be
+    /// working or filled, so this must never read as "nothing happened".
+    Unknown { filled: f64, message: String },
+}
+
+/// Market buy; returns (filled qty, average fill).
 async fn enter(
     client: &Client,
-    opt: &ResolvedOption,
+    opt: &ResolvedContract,
     quantity: f64,
     t: &mut Tracker,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
-) -> Result<(f64, f64), (f64, String)> {
+) -> Result<(f64, f64), EntryFailure> {
     let order_id = client.next_order_id();
     let mut order = order_builder::market_order(Action::Buy, quantity);
     order.tif = ibapi::orders::TimeInForce::Day;
     t.u.entry_order_id = Some(order_id);
+    t.own(order_id);
     // Keep "Triggered: …" from the trigger step, if any.
     let prefix = if t.u.message.starts_with("Triggered") { format!("{}. ", t.u.message) } else { String::new() };
     t.set(StrategyState::Entering, format!("{prefix}Buying {quantity} at market (order #{order_id})"));
 
-    let mut sub = client
+    let mut sub = track(client, order_id).await.map_err(|e| EntryFailure::NotFilled(format!("entry not sent: {e}")))?;
+    // The tap does the tracking; dropping this subscription sends nothing to IB.
+    let _ = client
         .place_order(order_id, &opt.contract, &order)
         .await
-        .map_err(|e| (0.0, format!("entry rejected: {e}")))?
-        .filter_data();
+        .map_err(|e| EntryFailure::NotFilled(format!("entry rejected: {e}")))?;
 
     let mut filled = 0.0;
     let mut avg: Option<f64> = None;
@@ -429,7 +476,8 @@ async fn enter(
         tokio::select! {
             cmd = cmds.recv(), if cmds_open => match cmd {
                 Some(Cmd::Disarm) => {
-                    // Cancel the working entry; any partial fill is protected below.
+                    // Cancel the working entry; any partial fill is protected below. The
+                    // status tap keeps reporting after the cancel takes over the order id.
                     let _ = client.cancel_order(order_id, "").await;
                     t.u.message = "Cancelling entry…".into();
                     t.emit();
@@ -438,7 +486,7 @@ async fn enter(
                 None => cmds_open = false,
             },
             item = sub.next() => match item {
-                Some(Ok(PlaceOrder::OrderStatus(s))) => {
+                Some(Ok(s)) => {
                     filled = s.filled;
                     if let Some(p) = s.average_fill_price.filter(|p| *p > 0.0) {
                         avg = Some(p);
@@ -447,21 +495,25 @@ async fn enter(
                     t.u.average_fill = avg;
                     match s.status {
                         OrderStatusKind::Filled => {
-                            return avg.map(|a| (filled, a)).ok_or((filled, "filled without a price".into()));
+                            return avg.map(|a| (filled, a)).ok_or(EntryFailure::Unknown { filled, message: "filled without a price".into() });
                         }
                         OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive => {
                             if filled > 0.0 && let Some(a) = avg {
                                 return Ok((filled, a)); // partial fill: protect what we have
                             }
                             let why = if s.why_held.is_empty() { String::new() } else { format!(": {}", s.why_held) };
-                            return Err((0.0, format!("entry {:?}{why}", s.status)));
+                            return Err(EntryFailure::NotFilled(format!("entry {:?}{why}", s.status)));
                         }
                         _ => t.emit(),
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err((filled, format!("entry: {e}"))),
-                None => return Err((filled, "entry order stream ended before fill".into())),
+                // The tap reports an IB error only before any status: a rejection. Anything
+                // else leaves the order's fate unknown.
+                Some(Err(ibapi::Error::Notice(n))) if filled == 0.0 => {
+                    return Err(EntryFailure::NotFilled(format!("entry rejected: {}", n.message)));
+                }
+                Some(Err(e)) => return Err(EntryFailure::Unknown { filled, message: e.to_string() }),
+                None => return Err(EntryFailure::Unknown { filled, message: "order stream ended".into() }),
             }
         }
     }
@@ -486,56 +538,101 @@ impl std::fmt::Display for Exit {
     }
 }
 
-type ExitStream = Pin<Box<dyn Stream<Item = (Exit, i32, Result<PlaceOrder, ibapi::Error>)> + Send>>;
+type StatusStream = Pin<Box<dyn Stream<Item = Result<OrderStatus, ibapi::Error>> + Send>>;
+type ExitStream = Pin<Box<dyn Stream<Item = (Exit, i32, Result<OrderStatus, ibapi::Error>)> + Send>>;
+
+/// One order's statuses from ibapi's tap (starting with the latest one seen), which a
+/// cancel or modify re-registering the order id doesn't displace. Open it before placing.
+async fn track(client: &Client, order_id: i32) -> Result<StatusStream, ibapi::Error> {
+    Ok(Box::pin(client.order_status_stream(order_id).await?.filter_data()))
+}
 
 /// Places one sell-to-close in the OCA group and waits briefly for IB to accept it.
 async fn place_exit(
     client: &Client,
-    opt: &ResolvedOption,
+    opt: &ResolvedContract,
     kind: Exit,
     mut order: Order,
     oca: &str,
     tif: ibapi::orders::TimeInForce,
+    t: &mut Tracker,
 ) -> Result<(i32, ExitStream), String> {
     order.oca_group = oca.to_string();
-    order.oca_type = OcaType::CancelWithBlock;
+    order.oca_type = OcaType::ReduceWithBlock;
     order.tif = tif;
     order.transmit = true;
     let order_id = client.next_order_id();
-    let mut sub = client
+    t.own(order_id);
+    t.u.exit_order_ids.push(order_id);
+    let mut sub = track(client, order_id).await.map_err(|e| format!("{kind} not sent: {e}"))?;
+    // The tap does the tracking; dropping this subscription sends nothing to IB.
+    let _ = client
         .place_order(order_id, &opt.contract, &order)
         .await
-        .map_err(|e| format!("{kind} rejected: {e}"))?
-        .filter_data();
+        .map_err(|e| format!("{kind} rejected: {e}"))?;
 
     // Accepted once IB reports a working status; rejections come back as an error or Inactive.
-    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(item) = sub.next().await {
-            match item {
-                Ok(PlaceOrder::OrderStatus(s)) => match s.status {
-                    OrderStatusKind::Inactive | OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled => {
-                        return Err(format!("{kind} {:?} {}", s.status, s.why_held));
-                    }
-                    _ => return Ok(()),
-                },
-                Ok(_) => {}
-                Err(e) => return Err(format!("{kind} rejected: {e}")),
+    // Everything read here is replayed to the monitor: a market close can report Filled
+    // as its very first status.
+    let mut seen: Vec<OrderStatus> = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(5), sub.next()).await {
+        Ok(Some(Ok(s))) => match s.status {
+            OrderStatusKind::Inactive | OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled => {
+                return Err(format!("{kind} {:?} {}", s.status, s.why_held));
             }
-        }
-        Err(format!("{kind}: order stream ended"))
-    })
-    .await;
-    match accepted {
-        Ok(Ok(())) | Err(_) => {} // timeout: no status yet, keep tracking
-        Ok(Err(e)) => return Err(e),
+            _ => seen.push(s),
+        },
+        Ok(Some(Err(e))) => return Err(format!("{kind} rejected: {e}")),
+        Ok(None) => return Err(format!("{kind}: order stream ended")),
+        Err(_) => {} // timeout: no status yet, keep tracking
     }
-    Ok((order_id, Box::pin(sub.map(move |r| (kind, order_id, r)))))
+    let replay = futures::stream::iter(seen.into_iter().map(Ok));
+    Ok((order_id, Box::pin(replay.chain(sub).map(move |r| (kind, order_id, r)))))
+}
+
+/// Fills across the exit orders. Under ReduceWithBlock a partial fill on one exit shrinks
+/// the others, so several exits can each sell part of the position.
+#[derive(Debug, Default)]
+pub(crate) struct ExitFills {
+    /// (order id, filled, average price)
+    by_order: Vec<(i32, f64, Option<f64>)>,
+}
+
+impl ExitFills {
+    /// `filled` is the order's cumulative fill, as IB reports it.
+    pub(crate) fn update(&mut self, order_id: i32, filled: f64, avg: Option<f64>) {
+        let avg = avg.filter(|p| positive(*p));
+        match self.by_order.iter_mut().find(|e| e.0 == order_id) {
+            Some(e) => {
+                e.1 = e.1.max(filled);
+                e.2 = avg.or(e.2);
+            }
+            None => self.by_order.push((order_id, filled, avg)),
+        }
+    }
+
+    pub(crate) fn filled(&self) -> f64 {
+        self.by_order.iter().map(|e| e.1).sum()
+    }
+
+    /// Volume-weighted across exits; None if any fill has no price yet.
+    pub(crate) fn average(&self) -> Option<f64> {
+        let filled = self.filled();
+        if filled <= 0.0 {
+            return None;
+        }
+        let mut notional = 0.0;
+        for (_, qty, avg) in self.by_order.iter().filter(|e| e.1 > 0.0) {
+            notional += qty * (*avg)?;
+        }
+        Some(notional / filled)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn protect_and_monitor(
     client: &Client,
-    opt: &ResolvedOption,
+    opt: &ResolvedContract,
     spec: &StrategySpec,
     quantity: f64,
     fill: f64,
@@ -546,17 +643,18 @@ async fn protect_and_monitor(
 ) {
     t.u.filled_quantity = quantity;
     t.u.average_fill = Some(fill);
-    let plan = match plan_exits(fill, quantity, opt.multiplier, spec.take_profit, spec.stop_loss, &opt.increments) {
-        Ok(p) => p,
-        Err(e) => return t.set(StrategyState::Unprotected, format!("Filled {quantity} @ {fill}, but exits not placed: {e}")),
-    };
-    t.u.take_profit_price = plan.take_profit;
-    t.u.stop_price = plan.stop;
-    t.u.stop_limit_price = plan.stop_limit;
-
     let oca = oca_group_name(t.u.entry_order_id.unwrap_or_default());
     let mut exits: SelectAll<ExitStream> = SelectAll::new();
     let mut problems: Vec<String> = Vec::new();
+
+    // A pricing failure still falls through to the monitor loop, so close-now works.
+    let plan = plan_exits(fill, quantity, opt.multiplier, spec.take_profit, spec.stop_loss, &opt.increments).unwrap_or_else(|e| {
+        problems.push(format!("exits not placed: {e}"));
+        ExitPlan::default()
+    });
+    t.u.take_profit_price = plan.take_profit;
+    t.u.stop_price = plan.stop;
+    t.u.stop_limit_price = plan.stop_limit;
 
     let mut orders: Vec<(Exit, Order)> = Vec::new();
     if let Some(tp) = plan.take_profit {
@@ -579,7 +677,7 @@ async fn protect_and_monitor(
     let mut eod_fallback: Option<jiff::Timestamp> = None;
     let mut placed = 0;
     for (kind, order) in orders {
-        match place_exit(client, opt, kind, order, &oca, tif.clone()).await {
+        match place_exit(client, opt, kind, order, &oca, tif.clone(), t).await {
             Ok((_, stream)) => {
                 exits.push(stream);
                 placed += 1;
@@ -596,6 +694,7 @@ async fn protect_and_monitor(
 
     let protective_failed = problems.iter().any(|p| !p.contains("keep it open"));
     let summary = format!("Filled {quantity} @ {fill}");
+    t.u.can_close = true;
     if protective_failed {
         t.set(StrategyState::Unprotected, format!("{summary}. {}", problems.join("; ")));
     } else if exits.is_empty() && eod_fallback.is_none() {
@@ -620,13 +719,14 @@ async fn protect_and_monitor(
     let mut cmds_open = true;
     let mut closing = false;
     let mut cancelled: Vec<i32> = Vec::new();
+    let mut fills = ExitFills::default();
     loop {
         tokio::select! {
             cmd = cmds.recv(), if cmds_open => match cmd {
                 Some(Cmd::CloseNow) if !closing => {
                     closing = true;
                     placed += 1;
-                    close_now(client, opt, quantity, &oca, tif.clone(), Exit::CloseNow, &mut exits, t).await;
+                    close_now(client, opt, quantity - fills.filled(), &oca, tif.clone(), Exit::CloseNow, &mut exits, t).await;
                 }
                 Some(_) => {}
                 None => cmds_open = false,
@@ -634,34 +734,40 @@ async fn protect_and_monitor(
             _ = &mut eod_sleep, if has_eod_fallback && !closing => {
                 closing = true;
                 placed += 1;
-                close_now(client, opt, quantity, &oca, tif.clone(), Exit::EodClose, &mut exits, t).await;
+                close_now(client, opt, quantity - fills.filled(), &oca, tif.clone(), Exit::EodClose, &mut exits, t).await;
             }
             item = exits.next(), if !exits.is_empty() => {
                 let Some((kind, order_id, item)) = item else { continue };
                 match item {
-                    Ok(PlaceOrder::OrderStatus(s)) => match s.status {
-                        OrderStatusKind::Filled => {
-                            let exit = s.average_fill_price.unwrap_or(0.0);
-                            t.u.exit_price = Some(exit);
-                            let pnl = (exit - fill) * quantity * opt.multiplier;
-                            t.u.realized_pnl = Some((pnl * 100.0).round() / 100.0);
-                            return t.set(StrategyState::Closed, format!("Closed by {kind} @ {exit}"));
+                    Ok(s) => {
+                        let sold_before = fills.filled();
+                        if s.filled > 0.0 {
+                            fills.update(order_id, s.filled, s.average_fill_price);
                         }
-                        // OCA siblings are cancelled when one exit fills, and those
+                        let sold = fills.filled();
+                        if sold >= quantity - 1e-9 {
+                            t.u.exit_price = fills.average();
+                            t.u.realized_pnl = t.u.exit_price.map(|exit| ((exit - fill) * quantity * opt.multiplier * 100.0).round() / 100.0);
+                            t.u.can_close = false;
+                            let at = t.u.exit_price.map_or("unknown price".into(), |p| p.to_string());
+                            return t.set(StrategyState::Closed, format!("Closed by {kind} @ {at}"));
+                        }
+                        if sold > sold_before {
+                            t.set(t.u.state, format!("{kind} sold {sold} of {quantity}; the other exits were reduced to the remaining {}", quantity - sold));
+                        }
+                        // OCA siblings are cancelled when the position is sold, and those
                         // cancels can arrive before the fill. Only alarm once every exit
-                        // is gone without a fill.
-                        OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive
-                            if !cancelled.contains(&order_id) =>
+                        // is gone without the whole position sold.
+                        if matches!(s.status, OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive)
+                            && !cancelled.contains(&order_id)
                         {
                             cancelled.push(order_id);
                             if cancelled.len() == placed && !closing {
-                                t.set(StrategyState::Unprotected, "All exit orders were cancelled; the position is open");
+                                t.set(StrategyState::Unprotected, format!("All exit orders were cancelled; {} still open", quantity - sold));
                             }
                         }
-                        _ => {}
-                    },
-                    Ok(_) => {}
-                    Err(e) => t.set(t.u.state, format!("{kind}: {e}")),
+                    }
+                    Err(e) => t.set(t.u.state, format!("Lost tracking of the {kind} order (it stays at IB): {e}")),
                 }
             }
             else => {
@@ -675,7 +781,7 @@ async fn protect_and_monitor(
 #[allow(clippy::too_many_arguments)]
 async fn close_now(
     client: &Client,
-    opt: &ResolvedOption,
+    opt: &ResolvedContract,
     quantity: f64,
     oca: &str,
     tif: ibapi::orders::TimeInForce,
@@ -684,9 +790,10 @@ async fn close_now(
     t: &mut Tracker,
 ) {
     let order = order_builder::market_order(Action::Sell, quantity);
-    match place_exit(client, opt, kind, order, oca, tif).await {
+    match place_exit(client, opt, kind, order, oca, tif, t).await {
         Ok((order_id, stream)) => {
             exits.push(stream);
+            t.u.can_close = false;
             t.set(StrategyState::Closing, format!("{kind}: selling {quantity} at market (order #{order_id})"));
         }
         Err(e) => t.set(StrategyState::Unprotected, format!("{kind} failed: {e}")),
@@ -772,6 +879,20 @@ mod tests {
         let sl = StopSpec { target: Target::Dollars { value: 1000.0 }, kind: StopKind::StopMarket };
         let p = plan_exits(0.50, 1.0, 100.0, None, Some(sl), PENNY).unwrap();
         assert_eq!(p.stop, Some(0.01));
+    }
+
+    #[test]
+    fn exit_fills_add_up_across_exits() {
+        let mut f = ExitFills::default();
+        f.update(10, 1.0, Some(1.50)); // take-profit sells 1 of 2
+        f.update(10, 1.0, None); // repeated status without a price keeps the price
+        f.update(11, 1.0, Some(0.70)); // reduced stop sells the other
+        assert_eq!(f.filled(), 2.0);
+        assert!((f.average().unwrap() - 1.10).abs() < 1e-9);
+
+        let mut g = ExitFills::default();
+        g.update(12, 1.0, None);
+        assert_eq!(g.average(), None, "never report a made-up exit price");
     }
 
     #[test]

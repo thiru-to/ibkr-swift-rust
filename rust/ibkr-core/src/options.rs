@@ -1,4 +1,4 @@
-//! Option chains, contract resolution and tick-size rounding.
+//! Option chains, contract resolution (by option spec or contract id) and tick-size rounding.
 
 use std::collections::BTreeSet;
 
@@ -55,8 +55,8 @@ pub async fn option_chain(client: &Client, symbol: &str) -> Result<OptionChain, 
     })
 }
 
-/// A fully-resolved option contract plus what's needed to price exits.
-pub struct ResolvedOption {
+/// A fully-resolved contract plus what's needed to price orders on it.
+pub struct ResolvedContract {
     pub contract: Contract,
     pub local_symbol: String,
     pub multiplier: f64,
@@ -74,7 +74,7 @@ pub fn option_contract(spec: &OptionSpec) -> Result<Contract, IbkrError> {
     Ok(builder.strike(spec.strike).expires_on(y, m, d).build())
 }
 
-pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<ResolvedOption, IbkrError> {
+pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<ResolvedContract, IbkrError> {
     let details = client.contract_details(&option_contract(spec)?).await.map_err(|e| IbkrError::Invalid {
         message: format!("{} {} {:?} {}: {e}", spec.symbol, spec.expiry, spec.right, spec.strike),
     })?;
@@ -87,14 +87,28 @@ pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<Resolv
         .ok_or_else(|| IbkrError::Invalid {
             message: format!("no {symbol} {:?} {} expiring {}", spec.right, spec.strike, spec.expiry),
         })?;
+    Ok(resolved(client, d).await)
+}
 
+/// Resolves a position's contract (any type) for SMART-routed quotes and orders.
+pub async fn resolve_contract_id(client: &Client, contract_id: i32) -> Result<ResolvedContract, IbkrError> {
+    let query = Contract { contract_id, exchange: "SMART".into(), ..Default::default() };
+    let details = client.contract_details(&query).await?;
+    let d = details
+        .first()
+        .ok_or_else(|| IbkrError::Invalid { message: format!("IB has no contract {contract_id}") })?;
+    Ok(resolved(client, d).await)
+}
+
+async fn resolved(client: &Client, d: &ContractDetails) -> ResolvedContract {
     // contract_details returns "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (10372).
     let mut contract = d.contract.clone();
     if let Some(date) = contract.last_trade_date_or_contract_month.split_whitespace().next() {
         contract.last_trade_date_or_contract_month = date.to_string();
     }
 
-    let multiplier = d.contract.multiplier.parse().unwrap_or(100.0);
+    // Stocks report no multiplier; options always do.
+    let multiplier = d.contract.multiplier.parse().unwrap_or(1.0);
     let mut increments = vec![(0.0, if d.min_tick > 0.0 { d.min_tick } else { 0.01 })];
     // market_rule_ids line up with valid exchanges; IB uses one rule for SMART-routed US options.
     if let Some(rule_id) = d.market_rule_ids.iter().find_map(|s| s.trim().parse::<i32>().ok())
@@ -105,12 +119,12 @@ pub async fn resolve_option(client: &Client, spec: &OptionSpec) -> Result<Resolv
         increments.sort_by(|a, b| a.0.total_cmp(&b.0));
     }
 
-    Ok(ResolvedOption {
+    ResolvedContract {
         local_symbol: d.contract.local_symbol.clone(),
         contract,
         multiplier,
         increments,
-    })
+    }
 }
 
 pub fn parse_expiry(expiry: &str) -> Result<(u16, u8, u8), IbkrError> {
@@ -128,6 +142,7 @@ pub fn parse_expiry(expiry: &str) -> Result<(u16, u8, u8), IbkrError> {
 pub enum Round {
     Up,
     Down,
+    Nearest,
 }
 
 /// The tick size that applies at `price` (bands are keyed by their low edge).
@@ -147,6 +162,7 @@ pub fn round_to_tick(price: f64, increments: &[(f64, f64)], dir: Round) -> f64 {
     let steps = match dir {
         Round::Up => (steps - 1e-9).ceil(),
         Round::Down => (steps + 1e-9).floor(),
+        Round::Nearest => steps.round(),
     };
     // Clean float noise (e.g. 1.2000000000000002).
     (steps * tick * 1e6).round() / 1e6

@@ -2,6 +2,7 @@
 
 mod options;
 mod orders;
+mod position;
 mod session;
 mod strategy;
 mod types;

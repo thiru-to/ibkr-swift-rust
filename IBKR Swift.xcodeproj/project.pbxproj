@@ -6,6 +6,10 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		7C377B70308A5A0000428C2E /* IbkrCore in Frameworks */ = {isa = PBXBuildFile; productRef = 7C377B71308A5A0000428C2E /* IbkrCore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		7C377B53308A595700428C2E /* IBKR Swift.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "IBKR Swift.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -22,6 +26,7 @@
 		7C377B50308A595700428C2E /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				7C377B70308A5A0000428C2E /* IbkrCore in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -50,6 +55,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 7C377B5E308A595800428C2E /* Build configuration list for PBXNativeTarget "IBKR Swift" */;
 			buildPhases = (
+				7C377B73308A5A0000428C2E /* Verify Rust Build */,
 				7C377B4F308A595700428C2E /* Sources */,
 				7C377B50308A595700428C2E /* Frameworks */,
 				7C377B51308A595700428C2E /* Resources */,
@@ -60,6 +66,9 @@
 				7C377B55308A595700428C2E /* IBKR Swift */,
 			);
 			name = "IBKR Swift";
+			packageProductDependencies = (
+				7C377B71308A5A0000428C2E /* IbkrCore */,
+			);
 			productName = "IBKR Swift";
 			productReference = 7C377B53308A595700428C2E /* IBKR Swift.app */;
 			productType = "com.apple.product-type.application";
@@ -88,6 +97,9 @@
 			);
 			mainGroup = 7C377B4A308A595700428C2E;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				7C377B72308A5A0000428C2E /* XCLocalSwiftPackageReference "IbkrCore" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 7C377B54308A595700428C2E /* Products */;
 			projectDirPath = "";
@@ -105,6 +117,28 @@
 			);
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		7C377B73308A5A0000428C2E /* Verify Rust Build */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Verify Rust Build";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# The Rust core is built by the scheme's build pre-action (scripts/build-rust.sh),\n# which must run before Swift packages compile. Pre-action failures don't stop the\n# build, so surface them here.\nif [ -f \"$SRCROOT/rust/target/build-rust.failed\" ]; then\n  echo \"error: scripts/build-rust.sh failed; run it in a terminal to see why\"\n  exit 1\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		7C377B4F308A595700428C2E /* Sources */ = {
@@ -242,7 +276,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -272,7 +308,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -313,6 +351,20 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		7C377B72308A5A0000428C2E /* XCLocalSwiftPackageReference "IbkrCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = IbkrCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		7C377B71308A5A0000428C2E /* IbkrCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = IbkrCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 7C377B4B308A595700428C2E /* Project object */;
 	validationLevel = 1;

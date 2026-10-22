@@ -1,0 +1,19 @@
+[package]
+name = "ibkr-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+name = "ibkr_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+ibapi = "5.2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+futures = "0.3"
+uniffi = { version = "0.32", features = ["cli", "tokio"] }
+thiserror = "2"

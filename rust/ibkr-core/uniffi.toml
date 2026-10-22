@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "IbkrCore"
+ffi_module_name = "IbkrCoreFFI"
+ffi_module_filename = "IbkrCoreFFI"

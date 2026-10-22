@@ -30,9 +30,9 @@ impl QuoteListener for Last {
     }
 }
 
-struct Orders(mpsc::Sender<Vec<OpenOrder>>);
+struct Orders(mpsc::Sender<Vec<OrderInfo>>);
 impl OrdersListener for Orders {
-    fn on_orders(&self, o: Vec<OpenOrder>) {
+    fn on_orders(&self, o: Vec<OrderInfo>) {
         let _ = self.0.send(o);
     }
     fn on_error(&self, m: String) {

@@ -18,7 +18,6 @@ use ibapi::contracts::tick_types::TickType;
 use ibapi::contracts::Contract;
 use ibapi::market_data::realtime::TickTypes;
 use ibapi::market_data::MarketDataType;
-use ibapi::orders::{OrderData, OrderStatus, OrderStatusKind, OrderUpdate, Orders};
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use ibapi::Client;
 use tokio::runtime::Runtime;
@@ -26,7 +25,7 @@ use tokio::task::AbortHandle;
 
 use crate::strategy::{self, StrategyHandle, StrategyListener};
 use crate::types::*;
-use crate::options;
+use crate::{options, orders};
 
 const LIVE_PORTS: [u16; 2] = [4001, 7496];
 
@@ -72,7 +71,7 @@ pub trait QuoteListener: Send + Sync {
 
 #[uniffi::export(with_foreign)]
 pub trait OrdersListener: Send + Sync {
-    fn on_orders(&self, orders: Vec<OpenOrder>);
+    fn on_orders(&self, orders: Vec<OrderInfo>);
     fn on_error(&self, message: String);
 }
 
@@ -211,7 +210,7 @@ impl IbkrSession {
     pub fn subscribe_orders(&self, listener: Arc<dyn OrdersListener>) -> Arc<StreamHandle> {
         let client = self.client.clone();
         spawn_stream(async move {
-            if let Err(e) = stream_orders(&client, listener.as_ref()).await {
+            if let Err(e) = orders::stream_orders(&client, listener.as_ref()).await {
                 listener.on_error(e.to_string());
             }
         })
@@ -418,79 +417,6 @@ fn apply_size(q: &mut Quote, tick: TickType, size: f64) -> bool {
         _ => return false,
     };
     set(slot, size)
-}
-
-// ---------------------------------------------------------------------------
-// Orders
-// ---------------------------------------------------------------------------
-
-fn is_terminal(status: &OrderStatusKind) -> bool {
-    matches!(
-        status,
-        OrderStatusKind::Filled | OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive
-    )
-}
-
-fn upsert_order(book: &mut BTreeMap<i32, OpenOrder>, d: OrderData) {
-    if is_terminal(&d.order_state.status) {
-        book.remove(&d.order_id);
-        return;
-    }
-    let filled = book.get(&d.order_id).map_or(0.0, |o| o.filled);
-    book.insert(
-        d.order_id,
-        OpenOrder {
-            order_id: d.order_id,
-            symbol: d.contract.symbol.to_string(),
-            action: format!("{:?}", d.order.action),
-            order_type: d.order.order_type.clone(),
-            quantity: d.order.total_quantity,
-            filled,
-            // IB reports 0 for "not set".
-            limit_price: d.order.limit_price.filter(|p| *p > 0.0),
-            stop_price: d.order.aux_price.filter(|p| *p > 0.0),
-            status: format!("{:?}", d.order_state.status),
-        },
-    );
-}
-
-fn apply_status(book: &mut BTreeMap<i32, OpenOrder>, s: OrderStatus) {
-    if is_terminal(&s.status) {
-        book.remove(&s.order_id);
-    } else if let Some(o) = book.get_mut(&s.order_id) {
-        o.status = format!("{:?}", s.status);
-        o.filled = s.filled;
-    }
-}
-
-async fn stream_orders(client: &Client, listener: &dyn OrdersListener) -> Result<(), IbkrError> {
-    // Open the live stream first so nothing placed during seeding is missed.
-    let updates = client.order_update_stream().await?;
-    let mut book: BTreeMap<i32, OpenOrder> = BTreeMap::new();
-
-    let mut seed = client.all_open_orders().await?.filter_data();
-    let seeding = async {
-        while let Some(Ok(item)) = seed.next().await {
-            match item {
-                Orders::OrderData(d) => upsert_order(&mut book, d),
-                Orders::OrderStatus(s) => apply_status(&mut book, s),
-            }
-        }
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(5), seeding).await;
-    drop(seed);
-    listener.on_orders(book.values().cloned().collect());
-
-    let mut updates = updates.filter_data();
-    while let Some(item) = updates.next().await {
-        match item? {
-            OrderUpdate::OpenOrder(d) => upsert_order(&mut book, d),
-            OrderUpdate::OrderStatus(s) => apply_status(&mut book, s),
-            _ => continue,
-        }
-        listener.on_orders(book.values().cloned().collect());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

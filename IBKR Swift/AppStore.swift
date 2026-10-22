@@ -45,7 +45,8 @@ final class AppStore {
     private(set) var summary: AccountSummary?
     private(set) var positions: [Position] = []
     private(set) var quote: Quote?
-    private(set) var orders: [OpenOrder] = []
+    /// Working orders plus today's completed ones, newest first.
+    private(set) var orders: [OrderInfo] = []
     var lastError: String?
 
     // Options
@@ -128,6 +129,13 @@ final class AppStore {
             update: { [weak self] in self?.positions = $0 },
             fail: { [weak self] in self?.lastError = $0 }
         ))
+        refreshOrders()
+    }
+
+    /// Re-subscribes, which reloads open and today's completed orders from IB.
+    func refreshOrders() {
+        guard let session else { return }
+        streams["orders"]?.cancel()
         streams["orders"] = session.subscribeOrders(listener: OrdersSink(
             update: { [weak self] in self?.orders = $0 },
             fail: { [weak self] in self?.lastError = $0 }
@@ -253,8 +261,9 @@ nonisolated extension Position: @retroactive Identifiable {
     public var id: String { "\(account)-\(contractId)" }
 }
 
-nonisolated extension OpenOrder: @retroactive Identifiable {
-    public var id: Int32 { orderId }
+nonisolated extension OrderInfo: @retroactive Identifiable {
+    /// Perm id is unique account-wide; completed orders placed outside the API have order id 0 or -1.
+    public var id: String { permId != 0 ? "p\(permId)" : "o\(orderId)" }
 }
 
 // MARK: - Listener sinks (called on Rust threads)
@@ -303,15 +312,15 @@ private nonisolated final class StrategySink: StrategyListener {
 }
 
 private nonisolated final class OrdersSink: OrdersListener {
-    let update: @MainActor @Sendable ([OpenOrder]) -> Void
+    let update: @MainActor @Sendable ([OrderInfo]) -> Void
     let fail: @MainActor @Sendable (String) -> Void
 
-    init(update: @escaping @MainActor @Sendable ([OpenOrder]) -> Void,
+    init(update: @escaping @MainActor @Sendable ([OrderInfo]) -> Void,
          fail: @escaping @MainActor @Sendable (String) -> Void) {
         self.update = update
         self.fail = fail
     }
 
-    func onOrders(orders: [OpenOrder]) { onMain { self.update(orders) } }
+    func onOrders(orders: [OrderInfo]) { onMain { self.update(orders) } }
     func onError(message: String) { onMain { self.fail(message) } }
 }

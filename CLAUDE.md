@@ -67,12 +67,21 @@ One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDela
 - **The trigger must be crossed after arming.** The first last-trade tick is a baseline, and arming fails if that baseline is already through the trigger.
 - **Every sell-to-close joins one OCA group (`CancelWithBlock`).** That covers take-profit, stop, the EOD close (a market order with an IB `TimeCondition`, "YYYYMMDD HH:MM:SS US/Eastern") and close-now. So at most one can fill, and none can open a short. Never place a closing order outside the group.
   - If IB rejects the time-conditioned EOD order, the task falls back to an app-side timer and sets `requires_app`.
+- **OCA group names must be unique for the whole account and day** (`oca_group_name`: nanosecond timestamp + entry order id). IB rejects every member of a group whose name has already filled ("OCA group is already filled"), and order ids and strategy ids restart per connection. A reused name once left a filled entry with no exits.
 - **Exit prices come from the actual average fill**, rounded with the contract's IB market rule (price bands) via `options::round_to_tick`. Take-profit rounds up and the stop rounds down, floored at one tick. `$` targets are for the whole position (÷ qty × multiplier).
 - **OCA siblings get cancelled when one exit fills**, and those cancels can arrive before the fill. Only report Unprotected when every exit is cancelled without a fill.
 - **Dropping a `StrategyHandle` before entry disarms it** (the command channel closes). During entry, it does *not* cancel the entry.
 - **`resolve_option` trims the expiry date.** `contract_details` returns `last_trade_date_or_contract_month` as "YYYYMMDD HH:MM:SS TZ", which IB rejects on orders (error 10372), so it's cut down to YYYYMMDD.
 - **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
 - **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Both runs passed on 2026-10-22, and IB accepted the time-conditioned EOD order inside the OCA group. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
+
+## Orders list (`rust/ibkr-core/src/orders.rs`)
+
+The order list (the `orders` stream) keeps every order IB reports instead of dropping finished ones. It's seeded from `all_open_orders()` plus `completed_orders(false)` (today's filled, cancelled and rejected orders, including manual TWS ones), then updated from `order_update_stream()`.
+
+- Orders are keyed by **perm id**, because completed orders placed outside the API carry order id 0 or -1. An order seen before IB assigns a perm id gets a provisional key, which migrates once the perm id arrives.
+- `OrderStatusGroup` buckets IB's statuses for the Orders screen filter: Open, Filled, Cancelled, Inactive and Other.
+- Completed orders report `total_quantity` 0 and can echo stale limit prices, which `upsert` normalizes.
 
 ## Build pipeline gotchas
 

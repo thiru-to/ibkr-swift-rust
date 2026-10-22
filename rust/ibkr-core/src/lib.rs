@@ -1,6 +1,7 @@
 //! Thin FFI layer over `ibapi` for the IBKR Swift app. See CLAUDE.md for the architecture.
 
 mod options;
+mod orders;
 mod session;
 mod strategy;
 mod types;

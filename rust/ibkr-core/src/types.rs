@@ -83,17 +83,46 @@ pub struct OrderRequest {
     pub tif: TimeInForce,
 }
 
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct OpenOrder {
+/// Coarse grouping of IB's order statuses, for filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum OrderStatusGroup {
+    /// ApiPending, PendingSubmit, PreSubmitted, Submitted, PendingCancel.
+    Open,
+    Filled,
+    /// Cancelled, ApiCancelled (IB also uses Cancelled for some rejections).
+    Cancelled,
+    /// Received but no longer active: rejected or cancelled by IB.
+    Inactive,
+    /// A status this version of ibapi doesn't model.
+    Other,
+}
+
+/// Any order IB reported this session: working orders plus today's completed ones.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct OrderInfo {
     pub order_id: i32,
+    /// IB's permanent id (unique across clients); 0 until IB assigns it.
+    pub perm_id: i64,
+    pub account: String,
     pub symbol: String,
+    /// IB's full contract name, e.g. "SPY   261022C00763000".
+    pub local_symbol: String,
+    pub sec_type: String,
     pub action: String,
     pub order_type: String,
+    pub tif: String,
     pub quantity: f64,
     pub filled: f64,
     pub limit_price: Option<f64>,
     pub stop_price: Option<f64>,
+    pub average_fill_price: Option<f64>,
+    /// IB's raw status, e.g. "PreSubmitted", "Filled", "ApiCancelled".
     pub status: String,
+    pub group: OrderStatusGroup,
+    /// Completion text ("Cancelled by Trader", "Filled Size: 1"), rejection reason, or why held.
+    pub detail: String,
+    /// When IB completed it (completed orders only), as sent by IB.
+    pub completed_time: String,
 }
 
 // ---------------------------------------------------------------------------

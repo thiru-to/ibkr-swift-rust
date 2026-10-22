@@ -161,6 +161,18 @@ pub(crate) fn validate_spec(spec: &StrategySpec, now_et: &Zoned) -> Result<Optio
     Ok(Some(EodClose { condition: at.strftime("%Y%m%d %H:%M:%S US/Eastern").to_string(), deadline: at.timestamp() }))
 }
 
+/// IB keeps OCA group names for the whole account and day: reusing one that already
+/// filled gets every member rejected ("OCA group is already filled"). Order ids and
+/// strategy ids restart per connection, so the name includes a nanosecond timestamp.
+pub(crate) fn oca_group_name(entry_order_id: i32) -> String {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = jiff::Timestamp::now().as_nanosecond() as u64;
+    // Strictly increasing even if two calls land in the same nanosecond.
+    let prev = LAST.try_update(Ordering::Relaxed, Ordering::Relaxed, |p| Some(p.max(now) + 1)).unwrap_or(0);
+    let stamp = prev.max(now) + 1;
+    format!("ibkr-swift-{stamp}-{entry_order_id}")
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct ExitPlan {
     pub take_profit: Option<f64>,
@@ -542,7 +554,7 @@ async fn protect_and_monitor(
     t.u.stop_price = plan.stop;
     t.u.stop_limit_price = plan.stop_limit;
 
-    let oca = format!("ibkr-swift-{}-{}", t.u.entry_order_id.unwrap_or_default(), t.u.id);
+    let oca = oca_group_name(t.u.entry_order_id.unwrap_or_default());
     let mut exits: SelectAll<ExitStream> = SelectAll::new();
     let mut problems: Vec<String> = Vec::new();
 
@@ -706,6 +718,15 @@ mod tests {
 
     fn at(hh: i8, mm: i8) -> Zoned {
         jiff::civil::date(2026, 10, 22).at(hh, mm, 0, 0).to_zoned(eastern()).unwrap()
+    }
+
+    #[test]
+    fn oca_names_never_repeat() {
+        // Same entry id, as happens across connections.
+        let a = oca_group_name(1);
+        let b = oca_group_name(1);
+        assert_ne!(a, b);
+        assert!(a.starts_with("ibkr-swift-") && a.ends_with("-1"));
     }
 
     #[test]

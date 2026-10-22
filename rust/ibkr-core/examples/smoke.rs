@@ -1,6 +1,6 @@
 //! Read-only smoke test against a running Gateway. Never places orders.
 //!
-//! cargo run --example smoke -- [port] [symbol]     (defaults: 4001 AAPL)
+//! cargo run --example smoke -- [port] [symbol]     (defaults: 4002 AAPL; pass 4001 for live)
 
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -29,7 +29,7 @@ impl QuoteListener for Quotes {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let port: u16 = args.next().map_or(Ok(4001), |p| p.parse())?;
+    let port: u16 = args.next().map_or(Ok(4002), |p| p.parse())?;
     let symbol = args.next().unwrap_or_else(|| "AAPL".into());
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

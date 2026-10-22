@@ -6,10 +6,12 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 
 ## Safety
 
-- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account** menu selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper.
+- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account** menu selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper. Host, port and client id persist too, so a port typed by hand survives a relaunch; `isLive` still catches it.
 - `AppStore.isLive` is deliberately conservative: it's true if the mode is Live, *or* the port is a live port (`IbkrSession::is_live()`: 4001 or 7496), *or* the account id doesn't start with `D` (IB paper ids look like `DU…`). A Paper/live mismatch shows a warning.
 - Every order submit in `OrdersView.swift` goes through a confirmation sheet (`OrderConfirmSheet`) that shows the account, LIVE/PAPER and price sanity warnings (`OrderCheck`). Keep that step, and keep the submit button free of a Return shortcut.
 - Position actions (`PositionDetailView.swift`: close, add stop/take-profit, edit a working order's price) also go through a review panel showing LIVE/PAPER, with no Return shortcut. Keep that.
+- Arming a strategy (`OptionsView.swift`) goes through a confirmation dialog showing LIVE/PAPER. The P/L simulator next to the ticket is display-only and must stay that way.
+- Quitting while a strategy still depends on the app (trigger not fired, entry in flight, app-side EOD close) asks first (`AppDelegate.applicationShouldTerminate`).
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
 
 ## Commands
@@ -21,10 +23,10 @@ Xcode is at `/Volumes/2TB/Applications/Xcode.app`. If `xcode-select` still point
 # Rust (from rust/)
 cargo build
 cargo test                          # all tests
-cargo test -p ibkr-core coalesces   # a single test by name
+cargo test -p ibkr-core coalesces_ticks   # a single test by name
 cargo test -p ibkr-core strategy::   # one module's tests
 cargo clippy --all-targets
-cargo run --example smoke -- 4001 AAPL   # read-only check against the running Gateway
+cargo run --example smoke -- 4002 AAPL   # read-only check against the running Gateway (paper by default; 4001 = live)
 
 # Regenerate Swift bindings + xcframework (normally done automatically by the scheme;
 # always builds Rust in release, since pre-actions don't reliably see the configuration)
@@ -49,17 +51,27 @@ SwiftUI views (IBKR Swift/, MainActor by default)
 
 - **Rust (`rust/ibkr-core/src/session.rs`)**: everything runs on one `OnceLock` Tokio runtime.
   - Async exports wrap their work in `run(...)`, which spawns onto that runtime. UniFFI's executor only polls a `JoinHandle`, so no `async_runtime` attribute is needed.
-  - Streams (positions, quote, orders) are spawned tasks that push **full snapshots** to a foreign listener trait (`PositionsListener`, `QuoteListener`, `OrdersListener`).
+  - Streams are spawned tasks that push **full snapshots** to a foreign listener trait: positions (`PositionsListener`), quotes by symbol / option / conid (`QuoteListener`), orders (`OrdersListener`), link status (`ConnectionListener`) and strategies (`StrategyListener`, in `strategy.rs`).
   - Every stream returns a `StreamHandle`. Calling `cancel()` or dropping it aborts the task, and dropping the `ibapi` subscription sends the IB-side cancel.
   - FFI types live in `types.rs`.
 - **Placing orders**: `place_order` uses `client.place_order` (not the builder's fire-and-forget `submit()`) and waits up to 5s for IB's first answer. A rejection (`ibapi::Error::Notice`) comes back as an error; no answer yet returns status "Sent". Dropping a `PlaceOrder` subscription does not cancel the order.
 - **Gateway drops**: ibapi reconnects by itself but fails every live subscription. The orders and positions streams rerun via `keep_streaming` once `is_connected()` is true again. `subscribe_connection` reports `LinkStatus` (socket loss is seen only by polling `is_connected()`; 1100/1101/1102 come as notices), and Swift re-requests quotes on `RestoredDataLost`.
+- **Price history**: `price_history` returns regular-hours trade bars for a `ChartRange` / `BarInterval`. Passing `end` (unix seconds of the oldest bar shown) pages back in time; the Quote chart (`PriceChart` + `ChartInput`) asks for older bars as the user pans or zooms out.
 - **Market data**: `connect` calls `switch_market_data_type(Delayed)`. IB still serves live data when the account has a subscription, and the quote's `delayed` flag reports which one you got.
 - **Swift isolation**: the app target sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
   - The generated bindings therefore live in the separate `IbkrCore/` package, which uses default isolation and Swift 5 mode. Don't move them into the app target.
   - Listener sinks in `AppStore.swift` are `nonisolated` classes that hop to the main queue. They use `DispatchQueue.main.async`, not `Task`, so updates stay in order.
   - `IbkrError`'s generated `errorDescription` is unreadable, so use `AppStore.report(_:)`, which unwraps the message.
 - **The project uses a file-system-synchronized group**: new `.swift` files under `IBKR Swift/` compile automatically, with no pbxproj edits. The target also enables `MemberImportVisibility`, so any file that touches IbkrCore types must `import IbkrCore`.
+
+## App (Swift)
+
+- Screens (`SidebarItem` in `ContentView.swift`): Account, Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies), Orders (ticket + list). The sidebar badges working orders and running strategies.
+- `AppStore` keeps one `StreamHandle` per key in `streams` (`"link"`, `"quote"`, `"ticket"`, `"position"`, `"underlying"`, …). Re-subscribing a key cancels the old handle first. `watched` remembers each quote key's symbol so `resubscribeQuotes` can re-request them after `RestoredDataLost`.
+- **Auto-connect** (Account menu → Connect Automatically, on by default): `startAutoConnect` runs at launch and retries with backoff from 2s to 30s while Gateway isn't up. Retry failures go to `lastAttemptError` (shown on the "Waiting for IB Gateway" screen), not the error banner. An explicit Disconnect stops it until next launch or a toggle.
+- **P/L simulator** (`PnLSimulatorView.swift`, `OptionMath.swift`): Black-Scholes, European, no dividends, a flat 4% rate, one volatility. IV is solved from the option's mid (or last/ask); entry is the ask for buy-now, or the theoretical price at the trigger plus half the spread. The time slider defaults to the ticket's close-at time. The ticket publishes its selections as `SimulationInput` via a binding.
+- **Split-view layout**: in `OptionsView`, pin every frame bound on `HSplitView` panes. A pane whose minimum size follows its content (live quotes, hover text) makes AppKit re-run layout mid-layout and abort the app; a nested `VSplitView` did exactly that.
+- `Eastern` (in `OptionsView.swift`) holds the US/Eastern date helpers (today, DTE, "HH:MM" today) used by the ticket and the simulator.
 
 ## Options strategies (`rust/ibkr-core/src/strategy.rs`, `options.rs`)
 

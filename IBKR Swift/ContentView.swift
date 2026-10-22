@@ -11,6 +11,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     case account = "Account"
     case positions = "Positions"
     case quote = "Quote"
+    case options = "Options"
     case orders = "Orders"
 
     var id: Self { self }
@@ -20,6 +21,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         case .account: "dollarsign.circle"
         case .positions: "list.bullet.rectangle"
         case .quote: "chart.line.uptrend.xyaxis"
+        case .options: "scope"
         case .orders: "arrow.left.arrow.right"
         }
     }
@@ -48,6 +50,7 @@ struct ContentView: View {
                     case .account: AccountView()
                     case .positions: PositionsView()
                     case .quote: QuoteView()
+                    case .options: OptionsView()
                     case .orders: OrdersView()
                     }
                 }

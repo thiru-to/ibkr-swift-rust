@@ -24,7 +24,9 @@ use ibapi::Client;
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
+use crate::strategy::{self, StrategyHandle, StrategyListener};
 use crate::types::*;
+use crate::options;
 
 const LIVE_PORTS: [u16; 2] = [4001, 7496];
 
@@ -167,10 +169,43 @@ impl IbkrSession {
     pub fn subscribe_quote(&self, symbol: String, listener: Arc<dyn QuoteListener>) -> Arc<StreamHandle> {
         let client = self.client.clone();
         spawn_stream(async move {
-            if let Err(e) = stream_quote(&client, symbol, listener.as_ref()).await {
+            let symbol = symbol.trim().to_uppercase();
+            let result = if symbol.is_empty() {
+                Err(invalid("symbol is required"))
+            } else {
+                stream_quote(&client, &Contract::stock(symbol.clone()).build(), symbol, listener.as_ref()).await
+            };
+            if let Err(e) = result {
                 listener.on_error(e.to_string());
             }
         })
+    }
+
+    /// Quote for one option contract; `Quote.symbol` is IB's local symbol.
+    pub fn subscribe_option_quote(&self, option: OptionSpec, listener: Arc<dyn QuoteListener>) -> Arc<StreamHandle> {
+        let client = self.client.clone();
+        spawn_stream(async move {
+            let result = async {
+                let opt = options::resolve_option(&client, &option).await?;
+                stream_quote(&client, &opt.contract, opt.local_symbol.clone(), listener.as_ref()).await
+            };
+            if let Err(e) = result.await {
+                listener.on_error(e.to_string());
+            }
+        })
+    }
+
+    pub async fn option_chain(&self, symbol: String) -> Result<OptionChain, IbkrError> {
+        let client = self.client.clone();
+        run(async move { options::option_chain(&client, &symbol).await }).await
+    }
+
+    /// Starts a strategy task. `allow_delayed` is forced off on live sessions.
+    pub fn arm_strategy(&self, mut spec: StrategySpec, listener: Arc<dyn StrategyListener>) -> Arc<StrategyHandle> {
+        if self.is_live() || !self.account.starts_with('D') {
+            spec.allow_delayed = false;
+        }
+        strategy::spawn(rt(), self.client.clone(), spec, listener)
     }
 
     pub fn subscribe_orders(&self, listener: Arc<dyn OrdersListener>) -> Arc<StreamHandle> {
@@ -332,13 +367,8 @@ async fn stream_positions(client: &Client, listener: &dyn PositionsListener) -> 
 // Quotes
 // ---------------------------------------------------------------------------
 
-async fn stream_quote(client: &Client, symbol: String, listener: &dyn QuoteListener) -> Result<(), IbkrError> {
-    let symbol = symbol.trim().to_uppercase();
-    if symbol.is_empty() {
-        return Err(invalid("symbol is required"));
-    }
-    let contract = Contract::stock(symbol.clone()).build();
-    let mut sub = client.market_data(&contract).subscribe().await?.filter_data();
+async fn stream_quote(client: &Client, contract: &Contract, symbol: String, listener: &dyn QuoteListener) -> Result<(), IbkrError> {
+    let mut sub = client.market_data(contract).subscribe().await?.filter_data();
     let mut quote = Quote { symbol, ..Default::default() };
 
     while let Some(item) = sub.next().await {

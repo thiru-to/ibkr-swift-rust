@@ -21,6 +21,7 @@ Xcode is at `/Volumes/2TB/Applications/Xcode.app`. If `xcode-select` still point
 cargo build
 cargo test                          # all tests
 cargo test -p ibkr-core coalesces   # a single test by name
+cargo test -p ibkr-core strategy::   # one module's tests
 cargo clippy --all-targets
 cargo run --example smoke -- 4001 AAPL   # read-only check against the running Gateway
 
@@ -57,6 +58,20 @@ SwiftUI views (IBKR Swift/, MainActor by default)
   - Listener sinks in `AppStore.swift` are `nonisolated` classes that hop to the main queue. They use `DispatchQueue.main.async`, not `Task`, so updates stay in order.
   - `IbkrError`'s generated `errorDescription` is unreadable, so use `AppStore.report(_:)`, which unwraps the message.
 - **The project uses a file-system-synchronized group**: new `.swift` files under `IBKR Swift/` compile automatically, with no pbxproj edits. The target also enables `MemberImportVisibility`, so any file that touches IbkrCore types must `import IbkrCore`.
+
+## Options strategies (`rust/ibkr-core/src/strategy.rs`, `options.rs`)
+
+One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDelayedData → Entering → Protected / Open → Closing → Closed. The off-ramps are Disarmed, Failed and Unprotected. Swift drives it through `StrategyHandle` (`disarm`, `close_now`) and renders `StrategyUpdate` snapshots. The app (not IB) watches the trigger. Invariants to preserve:
+
+- **Delayed data never fires a trigger**, unless `allow_delayed` is set. `IbkrSession::arm_strategy` forces it off on live ports and on non-`D` accounts, and the UI hides the toggle on live.
+- **The trigger must be crossed after arming.** The first last-trade tick is a baseline, and arming fails if that baseline is already through the trigger.
+- **Every sell-to-close joins one OCA group (`CancelWithBlock`).** That covers take-profit, stop, the EOD close (a market order with an IB `TimeCondition`, "YYYYMMDD HH:MM:SS US/Eastern") and close-now. So at most one can fill, and none can open a short. Never place a closing order outside the group.
+  - If IB rejects the time-conditioned EOD order, the task falls back to an app-side timer and sets `requires_app`.
+- **Exit prices come from the actual average fill**, rounded with the contract's IB market rule (price bands) via `options::round_to_tick`. Take-profit rounds up and the stop rounds down, floored at one tick. `$` targets are for the whole position (÷ qty × multiplier).
+- **OCA siblings get cancelled when one exit fills**, and those cancels can arrive before the fill. Only report Unprotected when every exit is cancelled without a fill.
+- **Dropping a `StrategyHandle` before entry disarms it** (the command channel closes). During entry, it does *not* cancel the entry.
+- **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
+- **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
 
 ## Build pipeline gotchas
 

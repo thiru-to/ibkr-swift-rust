@@ -7,6 +7,7 @@ import SwiftUI
 
 struct ConnectionBar: ToolbarContent {
     @Environment(AppStore.self) private var store
+    @State private var confirmDisconnect = false
 
     var body: some ToolbarContent {
         @Bindable var store = store
@@ -15,7 +16,17 @@ struct ConnectionBar: ToolbarContent {
                 ModeBadge(isLive: store.isLive)
                 Text(store.account).monospaced().foregroundStyle(.secondary)
                 Button("Disconnect", systemImage: "bolt.slash") {
-                    Task { await store.disconnect() }
+                    if store.appDependentStrategies > 0 {
+                        confirmDisconnect = true
+                    } else {
+                        Task { await store.disconnect() }
+                    }
+                }
+                .confirmationDialog("Disconnect with active strategies?", isPresented: $confirmDisconnect) {
+                    Button("Disconnect", role: .destructive) { Task { await store.disconnect() } }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Armed triggers stop and in-flight entries lose tracking. Protected positions keep their exit orders at IB.")
                 }
             } else {
                 ModeBadge(isLive: store.mode == .live)

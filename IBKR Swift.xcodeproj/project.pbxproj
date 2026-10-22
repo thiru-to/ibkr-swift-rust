@@ -122,21 +122,18 @@
 		7C377B73308A5A0000428C2E /* Verify Rust Build */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
 			name = "Verify Rust Build";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# The Rust core is built by the scheme's build pre-action (scripts/build-rust.sh),\n# which must run before Swift packages compile. Pre-action failures don't stop the\n# build, so surface them here.\nif [ -f \"$SRCROOT/rust/target/build-rust.failed\" ]; then\n  echo \"error: scripts/build-rust.sh failed; run it in a terminal to see why\"\n  exit 1\nfi\n";
+			shellScript = (
+				"# The Rust core is built by the scheme's build pre-action (scripts/build-rust.sh),",
+				"# which must run before Swift packages compile. Pre-action failures don't stop the",
+				"# build, so surface them here.",
+				"if [ -f \"$SRCROOT/rust/target/build-rust.failed\" ]; then",
+				"  echo \"error: scripts/build-rust.sh failed; run it in a terminal to see why\"",
+				"  exit 1",
+				"fi",
+				"",
+			);
 		};
 /* End PBXShellScriptBuildPhase section */
 

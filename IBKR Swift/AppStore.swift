@@ -48,6 +48,25 @@ final class AppStore {
     private(set) var orders: [OpenOrder] = []
     var lastError: String?
 
+    // Options
+    private(set) var chain: OptionChain?
+    private(set) var loadingChain = false
+    private(set) var underlyingQuote: Quote?
+    private(set) var optionQuote: Quote?
+    private(set) var strategyUpdates: [UInt64: StrategyUpdate] = [:]
+    /// What was armed, for display (the Rust side only reports progress).
+    private(set) var strategySpecs: [UInt64: StrategySpec] = [:]
+    @ObservationIgnored private var strategyHandles: [UInt64: StrategyHandle] = [:]
+
+    var strategies: [StrategyUpdate] {
+        strategyUpdates.values.sorted { $0.id > $1.id }
+    }
+
+    /// Strategies that stop working if the app quits or disconnects.
+    var appDependentStrategies: Int {
+        strategyUpdates.values.filter(\.requiresApp).count
+    }
+
     @ObservationIgnored private var session: IbkrSession?
     @ObservationIgnored private var streams: [String: StreamHandle] = [:]
 
@@ -96,6 +115,12 @@ final class AppStore {
         positions = []
         quote = nil
         orders = []
+        chain = nil
+        underlyingQuote = nil
+        optionQuote = nil
+        strategyHandles.removeAll()
+        strategyUpdates.removeAll()
+        strategySpecs.removeAll()
     }
 
     private func startStreams(_ session: IbkrSession) {
@@ -130,6 +155,64 @@ final class AppStore {
             update: { [weak self] in self?.quote = $0 },
             fail: { [weak self] in self?.lastError = $0 }
         ))
+    }
+
+    // MARK: Options
+
+    /// Loads the chain and starts streaming the underlying.
+    func loadChain(symbol: String) async {
+        let symbol = symbol.trimmingCharacters(in: .whitespaces).uppercased()
+        guard let session, !symbol.isEmpty else { return }
+        loadingChain = true
+        defer { loadingChain = false }
+        streams["underlying"]?.cancel()
+        underlyingQuote = nil
+        streams["underlying"] = session.subscribeQuote(symbol: symbol, listener: QuoteSink(
+            update: { [weak self] in self?.underlyingQuote = $0 },
+            fail: { [weak self] in self?.lastError = $0 }
+        ))
+        do {
+            chain = try await session.optionChain(symbol: symbol)
+        } catch {
+            chain = nil
+            report(error)
+        }
+    }
+
+    func watchOption(_ option: OptionSpec?) {
+        streams["option"]?.cancel()
+        optionQuote = nil
+        guard let session, let option else { return }
+        streams["option"] = session.subscribeOptionQuote(option: option, listener: QuoteSink(
+            update: { [weak self] in self?.optionQuote = $0 },
+            fail: { [weak self] in self?.lastError = $0 }
+        ))
+    }
+
+    func arm(_ spec: StrategySpec) {
+        guard let session else { return }
+        var spec = spec
+        if isLive { spec.allowDelayed = false }
+        let handle = session.armStrategy(spec: spec, listener: StrategySink(
+            update: { [weak self] in self?.strategyUpdates[$0.id] = $0 }
+        ))
+        strategyHandles[handle.id()] = handle
+        strategySpecs[handle.id()] = spec
+    }
+
+    func disarm(_ id: UInt64) {
+        strategyHandles[id]?.disarm()
+    }
+
+    func closeNow(_ id: UInt64) {
+        strategyHandles[id]?.closeNow()
+    }
+
+    /// Removes a finished strategy from the list.
+    func dismissStrategy(_ id: UInt64) {
+        strategyHandles[id] = nil
+        strategyUpdates[id] = nil
+        strategySpecs[id] = nil
     }
 
     // MARK: Orders
@@ -207,6 +290,16 @@ private nonisolated final class QuoteSink: QuoteListener {
 
     func onQuote(quote: Quote) { onMain { self.update(quote) } }
     func onError(message: String) { onMain { self.fail(message) } }
+}
+
+private nonisolated final class StrategySink: StrategyListener {
+    let update: @MainActor @Sendable (StrategyUpdate) -> Void
+
+    init(update: @escaping @MainActor @Sendable (StrategyUpdate) -> Void) {
+        self.update = update
+    }
+
+    func onUpdate(update: StrategyUpdate) { onMain { self.update(update) } }
 }
 
 private nonisolated final class OrdersSink: OrdersListener {

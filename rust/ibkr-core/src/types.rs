@@ -94,3 +94,129 @@ pub struct OpenOrder {
     pub limit_price: Option<f64>,
     pub status: String,
 }
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OptionRight {
+    Call,
+    Put,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct OptionSpec {
+    pub symbol: String,
+    /// "YYYYMMDD"
+    pub expiry: String,
+    pub right: OptionRight,
+    pub strike: f64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OptionChain {
+    pub symbol: String,
+    pub underlying_conid: i32,
+    /// Sorted "YYYYMMDD"; the first entry is the nearest expiry.
+    pub expirations: Vec<String>,
+    /// Union across expirations; not every strike exists for every expiry.
+    pub strikes: Vec<f64>,
+    pub multiplier: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Strategies: trigger on the underlying → market buy → OCA exits
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TriggerDirection {
+    /// Fires when the underlying's last trade is at or above the price.
+    RisesTo,
+    /// Fires when the underlying's last trade is at or below the price.
+    FallsTo,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Trigger {
+    pub underlying: String,
+    pub direction: TriggerDirection,
+    pub price: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum Target {
+    /// Percent of the entry premium.
+    Percent { value: f64 },
+    /// Total dollars for the whole position.
+    Dollars { value: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum StopKind {
+    StopMarket,
+    /// Limit = stop − offset.
+    StopLimit { limit_offset: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct StopSpec {
+    pub target: Target,
+    pub kind: StopKind,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct StrategySpec {
+    pub option: OptionSpec,
+    pub quantity: f64,
+    /// None = enter immediately.
+    pub trigger: Option<Trigger>,
+    pub take_profit: Option<Target>,
+    pub stop_loss: Option<StopSpec>,
+    /// "HH:MM" US/Eastern, today.
+    pub eod_close: Option<String>,
+    /// Let the trigger fire on delayed data. Paper testing only; the app forces it off on live.
+    pub allow_delayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StrategyState {
+    Arming,
+    Armed,
+    /// Trigger is paused because the underlying's data is delayed.
+    WaitingDelayedData,
+    Entering,
+    /// Filled, with exit orders held by IB.
+    Protected,
+    /// Filled, no exits were requested.
+    Open,
+    Closing,
+    Closed,
+    Disarmed,
+    Failed,
+    /// Filled but an exit order was rejected: the position needs attention.
+    Unprotected,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct StrategyUpdate {
+    pub id: u64,
+    pub state: StrategyState,
+    pub message: String,
+    pub option_local_symbol: String,
+    pub underlying_last: Option<f64>,
+    pub underlying_delayed: bool,
+    pub entry_order_id: Option<i32>,
+    pub filled_quantity: f64,
+    pub average_fill: Option<f64>,
+    pub take_profit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub stop_limit_price: Option<f64>,
+    /// "YYYYMMDD HH:MM:SS US/Eastern"
+    pub eod_close_at: Option<String>,
+    pub exit_price: Option<f64>,
+    pub realized_pnl: Option<f64>,
+    /// The app must stay open and connected for this strategy to work (trigger not yet
+    /// fired, entry in flight, or the EOD close is app-managed).
+    pub requires_app: bool,
+}

@@ -6,18 +6,19 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 
 ## Safety
 
-- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account** menu selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper. Host, port and client id persist too, so a port typed by hand survives a relaunch; `isLive` still catches it.
+- **Port 4001 is the LIVE Gateway port (real money)**; 4002 is paper. The **Account → Trading Mode** menu (only while disconnected) selects Live or Paper, which sets the port; the choice persists in UserDefaults and defaults to Paper. Host, port and client id persist too, so a port typed by hand survives a relaunch; `isLive` still catches it.
 - `AppStore.isLive` is deliberately conservative: it's true if the mode is Live, *or* the port is a live port (`IbkrSession::is_live()`: 4001 or 7496), *or* the account id doesn't start with `D` (IB paper ids look like `DU…`). A Paper/live mismatch shows a warning.
 - Every order submit in `OrdersView.swift` goes through a confirmation sheet (`OrderConfirmSheet`) that shows the account, LIVE/PAPER and price sanity warnings (`OrderCheck`). Keep that step, and keep the submit button free of a Return shortcut.
 - Position actions (`PositionDetailView.swift`: close, add stop/take-profit, edit a working order's price) also go through a review panel showing LIVE/PAPER, with no Return shortcut. Keep that.
 - Arming a strategy (`OptionsView.swift`) goes through a confirmation dialog showing LIVE/PAPER. The P/L simulator next to the ticket is display-only and must stay that way.
 - Risk controls (`risk.rs`, below) gate every opening order. Never add an order path that skips `RiskGuard::check_entry`, and never gate an exit with it.
-- Quitting while a strategy still depends on the app (trigger not fired, entry in flight, app-side EOD close) asks first (`AppDelegate.applicationShouldTerminate`).
+- Quitting while a strategy still depends on the app (trigger not fired, entry in flight, app-side EOD close) asks first (`AppDelegate.applicationShouldTerminate` in `IBKR_SwiftApp.swift`).
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
 
 ## Commands
 
 Rust isn't on PATH in non-login shells, so run `source ~/.cargo/env` first.
+Only the Rust crate has tests (unit tests inside `src/*.rs`); there is no Swift test target. Targets: Apple Silicon (arm64 only), macOS 27 SDK.
 Xcode is at `/Volumes/2TB/Applications/Xcode.app`. If `xcode-select` still points at the Command Line Tools, prefix xcodebuild with `DEVELOPER_DIR=/Volumes/2TB/Applications/Xcode.app/Contents/Developer`.
 
 ```sh
@@ -67,7 +68,7 @@ SwiftUI views (IBKR Swift/, MainActor by default)
 
 ## App (Swift)
 
-- Screens (`SidebarItem` in `ContentView.swift`): Account (with the Risk card, `RiskView.swift`), Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies), Orders (ticket + list). The sidebar badges working orders and running strategies.
+- Screens (`SidebarItem` in `ContentView.swift`; views live in `IBKR Swift/Views/`): Account (with the Risk card, `RiskView.swift`), Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies = `StrategiesView.swift`), Orders (ticket + list). The sidebar badges working orders and running strategies.
 - `AppStore` keeps one `StreamHandle` per key in `streams` (`"link"`, `"quote"`, `"ticket"`, `"position"`, `"underlying"`, …). Re-subscribing a key cancels the old handle first. `watched` remembers each quote key's symbol so `resubscribeQuotes` can re-request them after `RestoredDataLost`.
 - **Auto-connect** (Account menu → Connect Automatically, on by default): `startAutoConnect` runs at launch and retries with backoff from 2s to 30s while Gateway isn't up. Retry failures go to `lastAttemptError` (shown on the "Waiting for IB Gateway" screen), not the error banner. An explicit Disconnect stops it until next launch or a toggle.
 - **P/L simulator** (`PnLSimulatorView.swift`, `OptionMath.swift`): Black-Scholes, European, no dividends, a flat 4% rate, one volatility. IV is solved from the option's mid (or last/ask); entry is the ask for buy-now, or the theoretical price at the trigger plus half the spread. The time slider defaults to the ticket's close-at time. The ticket publishes its selections as `SimulationInput` via a binding.

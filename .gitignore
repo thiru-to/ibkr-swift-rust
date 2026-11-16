@@ -6,3 +6,5 @@ xcuserdata/
 /IbkrCore/IbkrCoreFFI.xcframework/
 /IbkrCore/.build/
 /IbkrCore/.swiftpm/
+build/
+dist/

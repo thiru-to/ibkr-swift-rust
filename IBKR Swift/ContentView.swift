@@ -31,32 +31,46 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @Environment(AppStore.self) private var store
     @State private var selection: SidebarItem? = .account
+    @State private var columns: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             List(SidebarItem.allCases, selection: $selection) { item in
                 Label(item.rawValue, systemImage: item.icon)
                     .badge(badge(item))
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
-            Group {
-                if store.connection != .connected {
-                    NotConnectedView()
-                } else {
-                    switch selection ?? .account {
-                    case .account: AccountView()
-                    case .positions: PositionsView()
-                    case .quote: QuoteView()
-                    case .options: OptionsView()
-                    case .orders: OrdersView()
-                    }
+            HStack(spacing: 0) {
+                // Collapsed sidebar: keep an icon rail so screens stay one click away.
+                if columns == .detailOnly {
+                    IconRail(selection: $selection, badge: badge)
+                    Divider()
                 }
+                screen
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .safeAreaInset(edge: .bottom) { Banners() }
             .overlay(alignment: .topTrailing) { ToastStack() }
         }
         .toolbar { ConnectionBar() }
+    }
+
+    @ViewBuilder
+    private var screen: some View {
+        Group {
+            if store.connection != .connected {
+                NotConnectedView()
+            } else {
+                switch selection ?? .account {
+                case .account: AccountView()
+                case .positions: PositionsView()
+                case .quote: QuoteView()
+                case .options: OptionsView()
+                case .orders: OrdersView()
+                }
+            }
+        }
     }
 
     /// Counts that need attention: working orders, running strategies.
@@ -67,6 +81,49 @@ struct ContentView: View {
         case .options: return store.activeStrategyCount
         default: return 0
         }
+    }
+}
+
+/// Icon-only navigation shown while the sidebar is collapsed.
+private struct IconRail: View {
+    @Binding var selection: SidebarItem?
+    let badge: (SidebarItem) -> Int
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(SidebarItem.allCases) { item in
+                let selected = (selection ?? .account) == item
+                Button { selection = item } label: {
+                    Image(systemName: item.icon)
+                        .font(.system(size: 15))
+                        .frame(width: 32, height: 28)
+                        .foregroundStyle(selected ? Color.accentColor : .secondary)
+                        .background(selected ? Color.accentColor.opacity(0.15) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 6))
+                        .overlay(alignment: .topTrailing) {
+                            let n = badge(item)
+                            if n > 0 {
+                                Text("\(n)")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .monospacedDigit()
+                                    .padding(.horizontal, 3)
+                                    .frame(minWidth: 13, minHeight: 13)
+                                    .background(.red, in: Capsule())
+                                    .foregroundStyle(.white)
+                                    .offset(x: 4, y: -3)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(item.rawValue)
+                .accessibilityLabel(item.rawValue)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 6)
+        .frame(width: 44)
     }
 }
 

@@ -179,6 +179,7 @@ pub(crate) async fn close(ctx: Ctx<'_>, contract_id: i32, expected_quantity: f64
     let mut order = order_builder::limit_order(action, quantity.abs(), price);
     order.tif = ibapi::orders::TimeInForce::Day;
     let order_id = ctx.client.next_order_id();
+    crate::orders::note_submit(order_id);
     let sub = ctx.client.place_order(order_id, &resolved.contract, &order).await?;
     let mut placed = await_ack(order_id, sub).await.map_err(|e| api(nothing_closed(&e, &cancelled)))?;
     if !cancelled.is_empty() {
@@ -240,6 +241,7 @@ pub(crate) async fn protect(
         order.tif = ibapi::orders::TimeInForce::GoodTillCanceled;
         order.transmit = true;
         let order_id = ctx.client.next_order_id();
+        crate::orders::note_submit(order_id);
         let result = match ctx.client.place_order(order_id, &resolved.contract, &order).await {
             Ok(sub) => await_ack(order_id, sub).await,
             Err(e) => Err(e.into()),

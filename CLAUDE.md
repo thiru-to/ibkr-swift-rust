@@ -11,6 +11,8 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 - Every order submit in `OrdersView.swift` goes through a confirmation sheet (`OrderConfirmSheet`) that shows the account, LIVE/PAPER and price sanity warnings (`OrderCheck`). Keep that step, and keep the submit button free of a Return shortcut.
 - Position actions (`PositionDetailView.swift`: close, add stop/take-profit, edit a working order's price) also go through a review panel showing LIVE/PAPER, with no Return shortcut. Keep that.
 - Arming a strategy (`OptionsView.swift`) goes through a confirmation dialog showing LIVE/PAPER. The P/L simulator next to the ticket is display-only and must stay that way.
+- The exception is **Quick Buy** on the Options screen, an immediate market buy of preset ATM contracts (default 10 SPY) on the nearest expiry with the ticket's exits. It still goes through `arm_strategy`, so the risk checks and OCA exits apply. It's one click on paper. On LIVE it opens `QuickBuyConfirmSheet`, where Cancel is the default and the buy button has no shortcut. A ~2s lockout blocks re-presses. Its keyboard shortcuts (`QuickBuyShortcuts.swift`, set in Settings) are off by default and work only while the Options screen shows. They must include ⌘ or ⌃ and can never be Return, Enter, Space, Tab or Esc. Keep those rules.
+- **Close Now** on a strategy row (`StrategiesView.swift`) sells at market right away, with no confirmation, on paper and LIVE alike. The user asked for this. It's an exit inside the strategy's OCA group, and the task ignores repeat presses once it's closing. The Close via Strategy button in `PositionDetailView` still asks first.
 - Risk controls (`risk.rs`, below) gate every opening order. Never add an order path that skips `RiskGuard::check_entry`, and never gate an exit with it.
 - Quitting while a strategy still depends on the app (trigger not fired, entry in flight, app-side EOD close) asks first (`AppDelegate.applicationShouldTerminate` in `IBKR_SwiftApp.swift`).
 - Never place orders while testing unless the user explicitly asks. `cargo run --example smoke` is read-only.
@@ -19,7 +21,7 @@ Minimal native macOS client for a locally running IB Gateway. The Rust core wrap
 
 Rust isn't on PATH in non-login shells, so run `source ~/.cargo/env` first.
 Only the Rust crate has tests (unit tests inside `src/*.rs`); there is no Swift test target. Targets: Apple Silicon (arm64 only), macOS 27 SDK.
-Xcode is at `/Volumes/2TB/Applications/Xcode.app`. If `xcode-select` still points at the Command Line Tools, prefix xcodebuild with `DEVELOPER_DIR=/Volumes/2TB/Applications/Xcode.app/Contents/Developer`.
+Xcode is normally at `/Applications/Xcode.app`. On the M4 mini it's at `/Volumes/2TB/Applications/Xcode.app` instead. If `xcode-select -p` points at the Command Line Tools, prefix xcodebuild with `DEVELOPER_DIR=<that Xcode>/Contents/Developer`.
 
 ```sh
 # Rust (from rust/)
@@ -58,6 +60,7 @@ SwiftUI views (IBKR Swift/, MainActor by default)
   - FFI types live in `types.rs`.
 - **Placing orders**: `place_order` uses `client.place_order` (not the builder's fire-and-forget `submit()`) and waits up to 5s for IB's first answer. A rejection (`ibapi::Error::Notice`) comes back as an error; no answer yet returns status "Sent". Dropping a `PlaceOrder` subscription does not cancel the order.
 - **Gateway drops**: ibapi reconnects by itself but fails every live subscription. The orders and positions streams rerun via `keep_streaming` once `is_connected()` is true again. `subscribe_connection` reports `LinkStatus` (socket loss is seen only by polling `is_connected()`; 1100/1101/1102 come as notices), and Swift re-requests quotes on `RestoredDataLost`.
+- **Position P&L**: `subscribe_position_pnl` streams IB's `pnl_single` (unrealized and daily P&L, and market value) for one contract. `AppStore.syncPositionPnl` keeps one stream (`"pnl.<conid>"`) per contract that a strategy holds filled (Protected / Open / Unprotected / Closing), and the strategy rows on the Options screen show it. It's the account's whole position in that contract, measured against IB's average cost, which includes the entry commission.
 - **Price history**: `price_history` returns regular-hours trade bars for a `ChartRange` / `BarInterval`. Passing `end` (unix seconds of the oldest bar shown) pages back in time; the Quote chart (`PriceChart` + `ChartInput`) asks for older bars as the user pans or zooms out.
 - **Market data**: `connect` calls `switch_market_data_type(Delayed)`. IB still serves live data when the account has a subscription, and the quote's `delayed` flag reports which one you got.
 - **Swift isolation**: the app target sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
@@ -68,7 +71,7 @@ SwiftUI views (IBKR Swift/, MainActor by default)
 
 ## App (Swift)
 
-- Screens (`SidebarItem` in `ContentView.swift`; views live in `IBKR Swift/Views/`): Account (with the Risk card, `RiskView.swift`), Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies = `StrategiesView.swift`), Orders (ticket + list). The sidebar badges working orders and running strategies.
+- Screens (`SidebarItem` in `ContentView.swift`; views live in `IBKR Swift/Views/`): Account (with the Risk card, `RiskView.swift`), Positions (detail sheet = `PositionDetailView`), Quote (quote cards + pannable chart), Options (strategy ticket, P/L simulator, running strategies = `StrategiesView.swift`), Orders (ticket + list). The sidebar badges working orders and running strategies. When the sidebar is collapsed (`columnVisibility == .detailOnly`), `IconRail` shows the same items and badges as icons at the detail's leading edge.
 - `AppStore` keeps one `StreamHandle` per key in `streams` (`"link"`, `"quote"`, `"ticket"`, `"position"`, `"underlying"`, …). Re-subscribing a key cancels the old handle first. `watched` remembers each quote key's symbol so `resubscribeQuotes` can re-request them after `RestoredDataLost`.
 - **Auto-connect** (Account menu → Connect Automatically, on by default): `startAutoConnect` runs at launch and retries with backoff from 2s to 30s while Gateway isn't up. Retry failures go to `lastAttemptError` (shown on the "Waiting for IB Gateway" screen), not the error banner. An explicit Disconnect stops it until next launch or a toggle.
 - **P/L simulator** (`PnLSimulatorView.swift`, `OptionMath.swift`): Black-Scholes, European, no dividends, a flat 4% rate, one volatility. IV is solved from the option's mid (or last/ask); entry is the ask for buy-now, or the theoretical price at the trigger plus half the spread. The time slider defaults to the ticket's close-at time. The ticket publishes its selections as `SimulationInput` via a binding.
@@ -96,6 +99,14 @@ One Tokio task per strategy, moving forward only: Arming → Armed / WaitingDela
 - **The chain is merged** from IB's per-exchange chains, preferring `trading_class == symbol` (SPY's chain also lists non-standard `2SPY` contracts).
 - **Paper end-to-end test:** `cargo run --example strategy_paper -- immediate|trigger`. It refuses non-paper accounts. Both runs passed on 2026-10-22, and IB accepted the time-conditioned EOD order inside the OCA group. Placing orders requires Gateway's "Read-Only API" to be off; otherwise IB returns error 321.
 
+## Fill latency (`rust/ibkr-core/src/latency.rs`)
+
+Each strategy entry (option market buy, including Quick Buy) is timed by a `Stopwatch` in `strategy::enter`.
+- IB's order statuses have no timestamps, and execution times are whole seconds. So every phase is timed on Tokio's monotonic clock (microseconds) as the event reaches the app, measured from the submit: sent to Gateway → IB's first status (the ack) → first fill → filled. Trigger → submit is recorded too.
+- The result travels in `StrategyUpdate.entry_timing`, and the finished record is appended as JSON lines to `Application Support/Latency/<account>.jsonl`. Swift sets that path with `open_latency_log`, which also returns the history.
+- The Options screen shows it on each strategy row and in `LatencySummaryBar` (last, median, p90), with a History… table (`LatencyView.swift`). Slippage is the average fill minus the ask at submit, when an ask was known (with a trigger or a cost limit).
+- Logging is best-effort: it must never block or fail an order. Exits (close-now, EOD) aren't timed yet.
+
 ## Risk controls (`rust/ibkr-core/src/risk.rs`)
 
 One `RiskGuard` per session (created in `connect`, started by Swift with `start_risk`). Limits: max daily loss and max cost per trade, each off when None. Invariants to preserve:
@@ -122,8 +133,18 @@ The order list (the `orders` stream) keeps every order IB reports instead of dro
 - `OrderStatusGroup` buckets IB's statuses for the Orders screen filter: Open, Filled, Cancelled, Inactive and Other.
 - Completed orders report `total_quantity` 0 and can echo stale limit prices, which `upsert` normalizes. They carry no fill price, so today's executions are seeded too (`apply_execution`, by perm id).
 - The update stream is read without `filter_data()`: order-bound notices carry IB's rejection reasons, which `Book::note` attaches to this client's order (or holds until it arrives). A status that arrives before its order is held too.
+- **Timeline**: `OrderInfo.timeline` holds the system-clock times (unix ms) at which the app saw each event: submitted (`orders::note_submit`, called before every new `place_order`, never on a modify), first seen, acknowledged (IB's first message), first fill, filled, and ended. `executions` lists each fill with IB's execution time (whole seconds, IB's only per-event time) and when it arrived. Orders loaded at connect are `from_snapshot`, so their earlier events aren't timed. A process-wide `Memory` keeps timings across book reloads (Refresh, reconnects). Clicking a row on the Orders screen opens `OrderDetailView`.
 - `OrderInfo.client_id`: order ids are only unique per client id, so the UI offers Cancel only for this connection's orders.
 - Swift toasts fills, partial fills, cancels and rejections by diffing snapshots (`AppStore.ordersChanged`); the first snapshot after connecting is the baseline.
+
+## Realized P&L ledger (`rust/ibkr-core/src/ledger.rs`)
+
+The Orders screen shows realized P/L net of fees (`PnLTallyView.swift`) with a Day / Week / Month / Year picker. Week starts Monday, and all periods use US/Eastern days.
+- **IB's API only returns about 7 days of executions**, so `subscribe_ledger` keeps a local ledger of fills and commission reports per account (Swift passes `Application Support/Ledger/<account>.json`; written via a temp file and rename). It backfills IB's window on connect, then polls every 10s with `executions(last_n_days)`. This polling works for every client, including TWS. It doesn't use `order_update_stream`, which allows only one subscriber, and `orders.rs` holds it.
+- **Net is IB's `realized_pnl` per closing fill**, which already subtracts the commissions on both legs. Don't subtract commissions again. "Commissions & fees" is the sum over every fill in the period, open positions included. IB's Double.MAX "no value" is filtered out.
+- Fills are keyed by exec id without its correction suffix, and the later correction wins. A commission report can arrive before or after its fill.
+- **Completeness:** `since` / `covered_through` track which days were actually read. Each read goes back to the last day covered, up to IB's 7-day maximum. If the app was off for longer, `since` restarts and the tally shows "Recorded since …". An unreadable ledger file is reported and never overwritten.
+- Importing older history from IB Flex statements is planned but not built.
 
 ## Position actions (`rust/ibkr-core/src/position.rs`)
 

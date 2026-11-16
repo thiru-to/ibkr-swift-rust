@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
-use ibapi::accounts::types::{AccountGroup, AccountId};
+use ibapi::accounts::types::{AccountGroup, AccountId, ContractId};
 use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
 use ibapi::contracts::tick_types::TickType;
 use ibapi::contracts::Contract;
@@ -26,6 +26,8 @@ use time::OffsetDateTime;
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
+use crate::latency::{self, LatencyLog};
+use crate::ledger::{self, LedgerListener};
 use crate::position::{self, Ctx};
 use crate::risk::{RiskGuard, RiskListener};
 use crate::strategy::{self, OwnedOrders, StrategyHandle, StrategyListener};
@@ -83,6 +85,12 @@ pub trait OrdersListener: Send + Sync {
 }
 
 #[uniffi::export(with_foreign)]
+pub trait PositionPnlListener: Send + Sync {
+    fn on_pnl(&self, pnl: PositionPnl);
+    fn on_error(&self, message: String);
+}
+
+#[uniffi::export(with_foreign)]
 pub trait ConnectionListener: Send + Sync {
     fn on_link(&self, status: LinkStatus, message: String);
 }
@@ -126,6 +134,8 @@ pub struct IbkrSession {
     /// Orders that running strategies placed; manual position actions leave them alone.
     strategy_orders: OwnedOrders,
     risk: Arc<RiskGuard>,
+    /// Where strategy entries log their fill timing (set by Swift).
+    latency: LatencyLog,
 }
 
 /// Connects to TWS / IB Gateway. Requests delayed market data as a fallback so quotes
@@ -145,7 +155,7 @@ pub async fn connect(host: String, port: u16, client_id: i32) -> Result<Arc<Ibkr
         let strategy_orders = OwnedOrders::default();
         let live = LIVE_PORTS.contains(&port) || !account.starts_with('D');
         let risk = RiskGuard::new(client.clone(), client_id, strategy_orders.clone(), live);
-        Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk }))
+        Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk, latency: Default::default() }))
     })
     .await
 }
@@ -266,7 +276,7 @@ impl IbkrSession {
         if self.is_live() || !self.account.starts_with('D') {
             spec.allow_delayed = false;
         }
-        strategy::spawn(rt(), self.client.clone(), spec, listener, self.strategy_orders.clone(), self.risk.clone())
+        strategy::spawn(rt(), self.client.clone(), spec, listener, self.strategy_orders.clone(), self.risk.clone(), self.latency.clone())
     }
 
     /// Starts the risk guard: loads the account's saved limits and halt from `state_path`,
@@ -294,6 +304,33 @@ impl IbkrSession {
             };
             tokio::join!(pnl, roll);
         })
+    }
+
+    /// Realized P&L tallies (Day / Week / Month / Year) from a local ledger of fills and
+    /// commissions at `state_path` (per account), backfilled from IB's last 7 days and then
+    /// polled. Snapshots are pushed whenever something changes. See `ledger.rs`.
+    pub fn subscribe_ledger(&self, state_path: String, listener: Arc<dyn LedgerListener>) -> Arc<StreamHandle> {
+        let (client, account) = (self.client.clone(), self.account.clone());
+        spawn_stream(async move { ledger::run_ledger(&client, account, state_path.into(), listener.as_ref()).await })
+    }
+
+    /// IB's live unrealized / daily P&L for the account's position in one contract.
+    /// Reruns after a Gateway reconnect.
+    pub fn subscribe_position_pnl(&self, contract_id: i32, listener: Arc<dyn PositionPnlListener>) -> Arc<StreamHandle> {
+        let (client, account) = (self.client.clone(), self.account.clone());
+        spawn_stream(async move {
+            let on_error = |e: String| listener.on_error(format!("Position P&L: {e}"));
+            keep_streaming(&client, on_error, || stream_position_pnl(&client, &account, contract_id, listener.as_ref())).await
+        })
+    }
+
+    /// Sets the per-account file strategy entries append their fill timing to, and
+    /// returns what it already holds (oldest first). See `latency.rs`.
+    pub fn open_latency_log(&self, path: String) -> Vec<OrderTiming> {
+        let path = std::path::PathBuf::from(path);
+        let history = latency::read(&path);
+        *self.latency.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        history
     }
 
     pub fn risk_status(&self) -> RiskStatus {
@@ -421,6 +458,7 @@ impl IbkrSession {
                 .map_err(|e| invalid(e.to_string()))?;
             let order_id = client.next_order_id();
             // Dropping this subscription later does not cancel the order (PlaceOrder has no cancel message).
+            crate::orders::note_submit(order_id);
             let sub = client.place_order(order_id, &contract, &order).await?;
             await_ack(order_id, sub).await
         })
@@ -736,6 +774,26 @@ async fn stream_pnl(client: &Client, account: &str, risk: &RiskGuard) -> Result<
     // No reading is current until the stream is back.
     risk.set_pnl(None);
     result
+}
+
+/// IB sends Double.MAX for "no value".
+fn pnl_value(v: f64) -> Option<f64> {
+    (v.is_finite() && v.abs() < 1e12).then_some(v)
+}
+
+async fn stream_position_pnl(client: &Client, account: &str, contract_id: i32, listener: &dyn PositionPnlListener) -> Result<(), IbkrError> {
+    let mut sub = client.pnl_single(&AccountId(account.to_string()), ContractId(contract_id), None).await?.filter_data();
+    while let Some(item) = sub.next().await {
+        let p = item?;
+        listener.on_pnl(PositionPnl {
+            contract_id,
+            position: p.position,
+            unrealized_pnl: pnl_value(p.unrealized_pnl),
+            daily_pnl: pnl_value(p.daily_pnl),
+            value: pnl_value(p.value),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

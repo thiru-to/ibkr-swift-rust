@@ -34,6 +34,7 @@ use jiff::civil::Time;
 use jiff::tz::TimeZone;
 use tokio::sync::{mpsc, watch};
 
+use crate::latency::{self, LatencyLog, Stopwatch};
 use crate::options::{self, ResolvedContract, Round};
 use crate::risk::RiskGuard;
 use crate::session::{ask_of, snapshot_ask};
@@ -86,11 +87,12 @@ pub(crate) fn spawn(
     listener: Arc<dyn StrategyListener>,
     owned: OwnedOrders,
     risk: Arc<RiskGuard>,
+    latency: LatencyLog,
 ) -> Arc<StrategyHandle> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime.spawn(run(client, id, spec, listener, rx, owned, risk));
+    runtime.spawn(run(client, id, spec, listener, rx, owned, risk, latency));
     Arc::new(StrategyHandle { id, cmds: tx })
 }
 
@@ -286,6 +288,7 @@ fn describe(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     client: Arc<Client>,
     id: u64,
@@ -294,6 +297,7 @@ async fn run(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     owned: OwnedOrders,
     risk: Arc<RiskGuard>,
+    latency: LatencyLog,
 ) {
     let mut t = Tracker {
         u: StrategyUpdate {
@@ -316,6 +320,7 @@ async fn run(
             realized_pnl: None,
             can_close: false,
             requires_app: true,
+            entry_timing: None,
         },
         listener,
         eod_by_app: false,
@@ -344,9 +349,13 @@ async fn run(
     let mut halt = risk.subscribe_halt();
 
     let mut ask = None;
+    let mut triggered_at = None;
     if let Some(trigger) = &spec.trigger {
         match wait_for_trigger(&client, trigger, &opt, spec.allow_delayed, &mut t, &mut cmds, &mut halt).await {
-            Ok(TriggerEnd::Fired { ask: latest }) => ask = latest,
+            Ok(TriggerEnd::Fired { ask: latest, at }) => {
+                ask = latest;
+                triggered_at = Some(at);
+            }
             Ok(TriggerEnd::Disarmed(why)) => return t.set(StrategyState::Disarmed, why),
             Err(e) => return t.set(StrategyState::Failed, e),
         }
@@ -361,7 +370,22 @@ async fn run(
         return t.set(state, format!("Entry not sent: {e}"));
     }
 
-    let (filled, fill) = match enter(&client, &opt, spec.quantity, &mut t, &mut cmds, &mut halt).await {
+    let mut watch: Option<Stopwatch> = None;
+    let entry = enter(&client, &opt, spec.quantity, (triggered_at, ask), &mut watch, &mut t, &mut cmds, &mut halt).await;
+    if let Some(w) = watch {
+        let mut timing = w.timing;
+        timing.outcome = match &entry {
+            Ok((filled, _)) if *filled >= spec.quantity => "Filled",
+            Ok(_) => "Partial",
+            Err(EntryFailure::NotFilled(m)) if m.contains("rejected") => "Rejected",
+            Err(EntryFailure::NotFilled(_)) => "Cancelled",
+            Err(EntryFailure::Unknown { .. }) => "Unknown",
+        }
+        .into();
+        latency::append(&latency, &timing);
+        t.u.entry_timing = Some(timing);
+    }
+    let (filled, fill) = match entry {
         Ok(v) => v,
         Err(EntryFailure::NotFilled(e)) => return t.set(StrategyState::Failed, e),
         Err(EntryFailure::Unknown { filled, message }) => {
@@ -381,8 +405,8 @@ fn is_last(tick: &TickType) -> bool {
 }
 
 enum TriggerEnd {
-    /// With the option's latest ask, for the entry's cost check.
-    Fired { ask: Option<f64> },
+    /// With the option's latest ask, for the entry's cost check, and when the trigger tick arrived.
+    Fired { ask: Option<f64>, at: tokio::time::Instant },
     Disarmed(String),
 }
 
@@ -476,8 +500,9 @@ async fn wait_for_trigger(
                     continue;
                 }
                 if trigger_hit(trigger, last) {
+                    let at = tokio::time::Instant::now();
                     t.u.message = format!("Triggered: {symbol} last {last}");
-                    return Ok(TriggerEnd::Fired { ask });
+                    return Ok(TriggerEnd::Fired { ask, at });
                 }
                 if t.u.state != StrategyState::Armed {
                     t.set(StrategyState::Armed, watching.clone());
@@ -497,11 +522,15 @@ enum EntryFailure {
     Unknown { filled: f64, message: String },
 }
 
-/// Market buy; returns (filled qty, average fill).
+/// Market buy; returns (filled qty, average fill). `watch` times it from the submit;
+/// `context` is when the trigger fired and the ask then, if known.
+#[allow(clippy::too_many_arguments)]
 async fn enter(
     client: &Client,
     opt: &ResolvedContract,
     quantity: f64,
+    context: (Option<tokio::time::Instant>, Option<f64>),
+    watch: &mut Option<Stopwatch>,
     t: &mut Tracker,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
     halt: &mut watch::Receiver<Option<String>>,
@@ -517,10 +546,14 @@ async fn enter(
 
     let mut sub = track(client, order_id).await.map_err(|e| EntryFailure::NotFilled(format!("entry not sent: {e}")))?;
     // The tap does the tracking; dropping this subscription sends nothing to IB.
+    let w = watch.insert(Stopwatch::start(order_id, &opt.local_symbol, quantity, context.0, context.1));
+    crate::orders::note_submit(order_id);
     let _ = client
         .place_order(order_id, &opt.contract, &order)
         .await
         .map_err(|e| EntryFailure::NotFilled(format!("entry rejected: {e}")))?;
+    w.sent();
+    t.u.entry_timing = Some(w.timing.clone());
 
     let mut filled = 0.0;
     let mut avg: Option<f64> = None;
@@ -555,6 +588,10 @@ async fn enter(
                     filled = s.filled;
                     if let Some(p) = s.average_fill_price.filter(|p| *p > 0.0) {
                         avg = Some(p);
+                    }
+                    if let Some(w) = watch.as_mut() {
+                        w.status(&format!("{:?}", s.status), filled, avg, s.status == OrderStatusKind::Filled);
+                        t.u.entry_timing = Some(w.timing.clone());
                     }
                     t.u.filled_quantity = filled;
                     t.u.average_fill = avg;
@@ -631,6 +668,7 @@ async fn place_exit(
     t.u.exit_order_ids.push(order_id);
     let mut sub = track(client, order_id).await.map_err(|e| format!("{kind} not sent: {e}"))?;
     // The tap does the tracking; dropping this subscription sends nothing to IB.
+    crate::orders::note_submit(order_id);
     let _ = client
         .place_order(order_id, &opt.contract, &order)
         .await

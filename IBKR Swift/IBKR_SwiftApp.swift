@@ -43,6 +43,10 @@ struct IBKR_SwiftApp: App {
                 Toggle("Connect Automatically", isOn: $store.autoConnect)
             }
         }
+
+        Settings {
+            SettingsView()
+        }
     }
 }
 

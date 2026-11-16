@@ -10,15 +10,19 @@ struct StrategiesView: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
-        List {
-            ForEach(store.strategies, id: \.id) { u in
-                StrategyRow(update: u, spec: store.strategySpecs[u.id])
+        VStack(spacing: 0) {
+            LatencySummaryBar()
+            Divider()
+            List {
+                ForEach(store.strategies, id: \.id) { u in
+                    StrategyRow(update: u, spec: store.strategySpecs[u.id])
+                }
             }
-        }
-        .overlay {
-            if store.strategies.isEmpty {
-                ContentUnavailableView("No Strategies", systemImage: "scope",
-                                       description: Text("Armed and recent strategies appear here."))
+            .overlay {
+                if store.strategies.isEmpty {
+                    ContentUnavailableView("No Strategies", systemImage: "scope",
+                                           description: Text("Armed and recent strategies appear here."))
+                }
             }
         }
     }
@@ -28,7 +32,6 @@ private struct StrategyRow: View {
     @Environment(AppStore.self) private var store
     let update: StrategyUpdate
     let spec: StrategySpec?
-    @State private var confirmClose = false
 
     var body: some View {
         let u = update
@@ -66,6 +69,32 @@ private struct StrategyRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                if let timing = u.entryTiming {
+                    GridRow {
+                        Text("Fill time").foregroundStyle(.secondary)
+                        Text(timing.filledMs.ms + (timing.filledMs == nil && timing.outcome == "Working" ? " (working…)" : ""))
+                            .fontWeight(.semibold)
+                        Text("ack \(timing.ackMs.ms) · 1st fill \(timing.firstFillMs.ms)\(slip(timing))")
+                            .foregroundStyle(.secondary)
+                            .help("Measured from the submit, as each IB event reached the app. Sent to Gateway in \(timing.sentMs.ms)\(timing.triggerToSubmitMs.map { "; trigger → submit \(Optional($0).ms)" } ?? "").")
+                    }
+                }
+                if let p = store.positionPnl[u.contractId], u.state != .closed, p.position != 0 {
+                    GridRow {
+                        Text("Unrealized").foregroundStyle(.secondary)
+                        if let pnl = p.unrealizedPnl {
+                            Text(pnl.formatted(.currency(code: "USD")) + percent(pnl, value: p.value))
+                                .fontWeight(.semibold)
+                                .foregroundStyle(pnlColor(pnl))
+                                .contentTransition(.numericText())
+                        } else {
+                            Text("—").foregroundStyle(.secondary)
+                        }
+                        Text(positionNote(p, u))
+                            .foregroundStyle(.secondary)
+                            .help("IB's mark-to-market against your average cost, which includes the entry commission. It covers the account's whole position in this contract.")
+                    }
+                }
                 if let pnl = u.realizedPnl {
                     GridRow {
                         Text("P&L").foregroundStyle(.secondary)
@@ -87,7 +116,10 @@ private struct StrategyRow: View {
                     Button("Cancel Entry") { store.disarm(u.id) }
                 case .protected, .open, .unprotected:
                     if u.canClose {
-                        Button("Close Now…") { confirmClose = true }
+                        // Immediate market sell, no confirmation (an exit only, inside the OCA group;
+                        // the strategy ignores repeat presses once it's closing).
+                        Button(store.isLive ? "Close Now (LIVE)" : "Close Now") { store.closeNow(u.id) }
+                            .tint(.red)
                     } else {
                         // The task has stopped tracking this position; the app can't act on it.
                         Text("Manage this position in TWS").font(.caption).foregroundStyle(.red)
@@ -103,16 +135,32 @@ private struct StrategyRow: View {
         }
         .card(padding: 12)
         .listRowSeparator(.hidden)
-        .confirmationDialog("Close position now?", isPresented: $confirmClose) {
-            Button(store.isLive ? "Sell LIVE at Market" : "Sell at Market", role: .destructive) { store.closeNow(u.id) }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Sells the remaining \(u.optionLocalSymbol) position at market. Working exits are cancelled by IB (same OCA group).")
-        }
     }
 }
 
 extension StrategyRow {
+    fileprivate func slip(_ t: OrderTiming) -> String {
+        guard let s = t.slippage else { return "" }
+        return " · slip \(s.formatted(.number.precision(.fractionLength(2)).sign(strategy: .always())))"
+    }
+
+    /// " (+12.5%)" of the cost basis (market value − unrealized).
+    fileprivate func percent(_ pnl: Double, value: Double?) -> String {
+        guard let value else { return "" }
+        let cost = value - pnl
+        guard abs(cost) > 0.005 else { return "" }
+        return " (" + (pnl / abs(cost)).formatted(.percent.precision(.fractionLength(1)).sign(strategy: .always())) + ")"
+    }
+
+    /// Market value, plus the account's size when it differs from this strategy's fill.
+    fileprivate func positionNote(_ p: PositionPnl, _ u: StrategyUpdate) -> String {
+        var note = p.value.map { "value \($0.formatted(.currency(code: "USD")))" } ?? ""
+        if p.position != u.filledQuantity {
+            note += (note.isEmpty ? "" : " · ") + "account holds \(p.position.quantity)"
+        }
+        return note
+    }
+
     /// Live prices of the working exits (they can be edited from the position details),
     /// falling back to the planned ones.
     fileprivate func exits(_ u: StrategyUpdate) -> String {

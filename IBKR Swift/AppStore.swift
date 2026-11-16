@@ -81,6 +81,8 @@ final class AppStore {
     var lastError: String?
     /// The risk guard's limits, halt and daily P&L; nil until it starts.
     private(set) var risk: RiskStatus?
+    /// Realized P&L tallies (Day / Week / Month / Year) for the Orders screen.
+    private(set) var ledger: LedgerSnapshot?
 
     // Options
     private(set) var chain: OptionChain?
@@ -91,6 +93,11 @@ final class AppStore {
     /// What was armed, for display (the Rust side only reports progress).
     private(set) var strategySpecs: [UInt64: StrategySpec] = [:]
     @ObservationIgnored private var strategyHandles: [UInt64: StrategyHandle] = [:]
+
+    /// IB's live P&L for positions that running strategies hold, by contract id.
+    private(set) var positionPnl: [Int32: PositionPnl] = [:]
+    /// Fill timing of finished strategy entries, oldest first (this account's log).
+    private(set) var latencyLog: [OrderTiming] = []
 
     var strategies: [StrategyUpdate] {
         strategyUpdates.values.sorted { $0.id > $1.id }
@@ -211,6 +218,7 @@ final class AppStore {
         orders = []
         orderMemory = nil
         risk = nil
+        ledger = nil
         lastPlacement = nil
         chain = nil
         underlyingQuote = nil
@@ -218,6 +226,8 @@ final class AppStore {
         strategyHandles.removeAll()
         strategyUpdates.removeAll()
         strategySpecs.removeAll()
+        positionPnl.removeAll()
+        latencyLog = []
     }
 
     private func startStreams(_ session: IbkrSession) {
@@ -232,7 +242,24 @@ final class AppStore {
             update: { [weak self] in self?.riskChanged($0) },
             fail: { [weak self] in self?.lastError = $0 }
         ))
+        latencyLog = session.openLatencyLog(path: Self.latencyPath(account: account))
+        streams["ledger"] = session.subscribeLedger(statePath: Self.ledgerPath(account: account), listener: LedgerSink(
+            update: { [weak self] in self?.ledger = $0 },
+            fail: { [weak self] in self?.lastError = $0 }
+        ))
         refreshOrders()
+    }
+
+    /// Fill timing of strategy entries, one JSON object per line, per account.
+    private static func latencyPath(account: String) -> String {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return dir.appending(path: "Latency/\(account).jsonl").path(percentEncoded: false)
+    }
+
+    /// Fills and commissions, per account, so Month / Year tallies outlive IB's 7-day window.
+    private static func ledgerPath(account: String) -> String {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return dir.appending(path: "Ledger/\(account).json").path(percentEncoded: false)
     }
 
     /// Re-subscribes, which reloads open and today's completed orders from IB.
@@ -326,7 +353,9 @@ final class AppStore {
 
     /// Why the guard would refuse an opening order costing `cost` (nil = unknown). The
     /// Rust side checks again right before sending; this is for immediate feedback.
-    func entryProblem(cost: Double?) -> String? {
+    /// With `requirePrice` false, an unknown cost isn't a problem here (the Rust side
+    /// snapshots the ask and checks it before sending).
+    func entryProblem(cost: Double?, requirePrice: Bool = true) -> String? {
         guard let risk else { return isLive ? "Risk controls aren't running yet." : nil }
         if let reason = risk.halted { return "Trading is halted for today (\(reason))." }
         if isLive && !risk.running { return "Risk controls aren't running, so opening orders are refused on live accounts." }
@@ -335,7 +364,9 @@ final class AppStore {
             if pnl <= -max { return "Daily loss limit reached." }
         }
         if let max = risk.limits.maxCostPerTrade {
-            guard let cost else { return "No price yet to check against the max cost per trade (\(Optional(max).money("USD")))." }
+            guard let cost else {
+                return requirePrice ? "No price yet to check against the max cost per trade (\(Optional(max).money("USD")))." : nil
+            }
             if cost > max { return "Est. cost \(Optional(cost).money("USD")) is above the max cost per trade (\(Optional(max).money("USD")))." }
         }
         return nil
@@ -498,7 +529,7 @@ final class AppStore {
         var spec = spec
         if isLive { spec.allowDelayed = false }
         let handle = session.armStrategy(spec: spec, listener: StrategySink(
-            update: { [weak self] in self?.strategyUpdates[$0.id] = $0 }
+            update: { [weak self] in self?.strategyChanged($0) }
         ))
         strategyHandles[handle.id()] = handle
         strategySpecs[handle.id()] = spec
@@ -517,6 +548,42 @@ final class AppStore {
         strategyHandles[id] = nil
         strategyUpdates[id] = nil
         strategySpecs[id] = nil
+        syncPositionPnl()
+    }
+
+    private func strategyChanged(_ update: StrategyUpdate) {
+        strategyUpdates[update.id] = update
+        // The Rust side logged it to disk; mirror it for the history view.
+        if let t = update.entryTiming, t.outcome != "Working",
+           !latencyLog.contains(where: { $0.orderId == t.orderId && $0.submittedAtMs == t.submittedAtMs }) {
+            latencyLog.append(t)
+        }
+        syncPositionPnl()
+    }
+
+    /// Keeps one IB P&L stream per contract that a strategy holds a filled position in.
+    private func syncPositionPnl() {
+        guard let session else { return }
+        let holding: Set<StrategyState> = [.protected, .open, .unprotected, .closing]
+        let wanted = Set(strategyUpdates.values
+            .filter { $0.contractId != 0 && $0.filledQuantity > 0 && holding.contains($0.state) }
+            .map(\.contractId))
+        for key in streams.keys where key.hasPrefix("pnl.") {
+            guard let id = Int32(key.dropFirst(4)), !wanted.contains(id) else { continue }
+            streams[key]?.cancel()
+            streams[key] = nil
+            positionPnl[id] = nil
+        }
+        for id in wanted where streams["pnl.\(id)"] == nil {
+            streams["pnl.\(id)"] = session.subscribePositionPnl(contractId: id, listener: PositionPnlSink(
+                update: { [weak self] p in
+                    // Ignore a last reading that lands after the stream was dropped.
+                    guard self?.streams["pnl.\(p.contractId)"] != nil else { return }
+                    self?.positionPnl[p.contractId] = p
+                },
+                fail: { [weak self] in self?.lastError = $0 }
+            ))
+        }
     }
 
     // MARK: Positions
@@ -727,6 +794,34 @@ private nonisolated final class RiskSink: RiskListener {
     }
 
     func onRisk(status: RiskStatus) { onMain { self.update(status) } }
+    func onError(message: String) { onMain { self.fail(message) } }
+}
+
+private nonisolated final class PositionPnlSink: PositionPnlListener {
+    let update: @MainActor @Sendable (PositionPnl) -> Void
+    let fail: @MainActor @Sendable (String) -> Void
+
+    init(update: @escaping @MainActor @Sendable (PositionPnl) -> Void,
+         fail: @escaping @MainActor @Sendable (String) -> Void) {
+        self.update = update
+        self.fail = fail
+    }
+
+    func onPnl(pnl: PositionPnl) { onMain { self.update(pnl) } }
+    func onError(message: String) { onMain { self.fail(message) } }
+}
+
+private nonisolated final class LedgerSink: LedgerListener {
+    let update: @MainActor @Sendable (LedgerSnapshot) -> Void
+    let fail: @MainActor @Sendable (String) -> Void
+
+    init(update: @escaping @MainActor @Sendable (LedgerSnapshot) -> Void,
+         fail: @escaping @MainActor @Sendable (String) -> Void) {
+        self.update = update
+        self.fail = fail
+    }
+
+    func onLedger(snapshot: LedgerSnapshot) { onMain { self.update(snapshot) } }
     func onError(message: String) { onMain { self.fail(message) } }
 }
 

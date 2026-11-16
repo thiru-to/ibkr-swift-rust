@@ -427,6 +427,9 @@ private enum OrderFilter: Hashable, CaseIterable {
 struct OrderListView: View {
     @Environment(AppStore.self) private var store
     @State private var filter = OrderFilter.open
+    /// Clicking a row opens its details.
+    @State private var selection: OrderInfo.ID?
+    @State private var detail: OrderRef?
 
     private func count(_ f: OrderFilter) -> Int {
         guard let group = f.group else { return store.orders.count }
@@ -440,6 +443,8 @@ struct OrderListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PnLTallyView()
+            Divider()
             HStack {
                 Picker("Status", selection: $filter) {
                     // "Other" only when IB sent a status ibapi doesn't model.
@@ -455,7 +460,7 @@ struct OrderListView: View {
             }
             .padding(8)
 
-            Table(shown) {
+            Table(shown, selection: $selection) {
                 TableColumn("ID") { o in Text(o.orderId > 0 ? String(o.orderId) : "—").foregroundStyle(.secondary) }.width(45)
                 TableColumn("Time") { o in Text(time(o.completedTime)).foregroundStyle(.secondary) }.width(65)
                 TableColumn("Symbol") { o in Text(o.displaySymbol).monospaced().fontWeight(.medium) }
@@ -488,6 +493,13 @@ struct OrderListView: View {
                 .width(70)
             }
             .monospacedDigit()
+            .onChange(of: selection) {
+                guard let id = selection, let o = store.orders.first(where: { $0.id == id }) else { return }
+                detail = OrderRef(o)
+            }
+            .sheet(item: $detail, onDismiss: { selection = nil }) { ref in
+                OrderDetailView(ref: ref)
+            }
             .overlay {
                 if shown.isEmpty {
                     ContentUnavailableView("No \(filter == .all ? "" : filter.title + " ")Orders", systemImage: "tray")

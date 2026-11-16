@@ -184,6 +184,45 @@ pub struct OrderInfo {
     pub detail: String,
     /// When IB completed it (completed orders only), as sent by IB.
     pub completed_time: String,
+    /// When each event reached this app (system clock, unix ms).
+    pub timeline: OrderTimeline,
+    /// Fills, oldest first, with IB's execution time and when each reached the app.
+    pub executions: Vec<OrderExecution>,
+}
+
+/// System-clock times (unix milliseconds) at which this app saw each event. IB sends no
+/// submit or acknowledgement time of its own.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct OrderTimeline {
+    /// This app sent it (None for orders from TWS, other clients, or an earlier run).
+    pub submitted_ms: Option<i64>,
+    /// First time the app heard of the order.
+    pub first_seen_ms: i64,
+    /// IB's first message about it (OpenOrder or OrderStatus).
+    pub ack_ms: Option<i64>,
+    /// The status in that first message, e.g. "PreSubmitted".
+    pub ack_status: String,
+    /// First report of a filled quantity (status or execution).
+    pub first_fill_ms: Option<i64>,
+    /// Status Filled.
+    pub filled_ms: Option<i64>,
+    /// Cancelled or Inactive.
+    pub ended_ms: Option<i64>,
+    /// Already existed when the orders were loaded, so earlier events weren't seen live.
+    pub from_snapshot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct OrderExecution {
+    pub exec_id: String,
+    /// IB's execution time, e.g. "20261116 10:23:45 US/Eastern" (whole seconds).
+    pub ib_time: String,
+    /// When the app received it (unix ms); the load time for `from_snapshot` ones.
+    pub received_ms: i64,
+    pub from_snapshot: bool,
+    pub shares: f64,
+    pub price: f64,
+    pub exchange: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +355,36 @@ pub struct StrategyUpdate {
     /// The app must stay open and connected for this strategy to work (trigger not yet
     /// fired, entry in flight, or the EOD close is app-managed).
     pub requires_app: bool,
+    /// How long the entry took, timed in the app (None until it's sent).
+    pub entry_timing: Option<OrderTiming>,
+}
+
+/// Timing of one market order, measured in the app as each event arrived (IB's own
+/// timestamps are whole seconds). Durations are milliseconds from the submit.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct OrderTiming {
+    pub order_id: i32,
+    pub local_symbol: String,
+    pub quantity: f64,
+    /// Wall clock at submit, unix milliseconds.
+    pub submitted_at_ms: i64,
+    /// Trigger tick → submit (risk checks, price snapshot); None without a trigger.
+    pub trigger_to_submit_ms: Option<f64>,
+    /// Submit → order written to Gateway.
+    pub sent_ms: Option<f64>,
+    /// Submit → IB's first status (its acknowledgement).
+    pub ack_ms: Option<f64>,
+    /// IB's first status, e.g. "PreSubmitted".
+    pub ack_status: String,
+    /// Submit → first (partial) fill reported.
+    pub first_fill_ms: Option<f64>,
+    /// Submit → completely filled.
+    pub filled_ms: Option<f64>,
+    pub average_fill: Option<f64>,
+    /// The option's ask when the order was sent, if known (for slippage).
+    pub ask_at_submit: Option<f64>,
+    /// "Working", "Filled", "Partial", "Cancelled", "Rejected" or "Unknown".
+    pub outcome: String,
 }
 
 /// Account risk limits. Each is off when None. Only opening orders are checked against them.
@@ -341,4 +410,63 @@ pub struct RiskStatus {
     pub daily_pnl: Option<f64>,
     /// The guard is running for this session. Live sessions refuse entries without it.
     pub running: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Realized P&L ledger
+// ---------------------------------------------------------------------------
+
+/// A US/Eastern calendar window ending today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum PnlPeriod {
+    Day,
+    /// Since Monday.
+    Week,
+    /// Since the 1st.
+    Month,
+    /// Since Jan 1.
+    Year,
+}
+
+/// Realized P&L for one period, from the fills recorded in it.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PnlTally {
+    pub period: PnlPeriod,
+    /// First day of the period, "YYYYMMDD".
+    pub from_day: String,
+    /// IB's realized P&L on closing fills, net of the commissions on both legs.
+    pub net_realized: f64,
+    /// Commissions and fees charged on every fill in the period (including still-open positions).
+    pub commissions: f64,
+    pub fills: u32,
+    /// Fills that realized P&L (closed something).
+    pub closing_fills: u32,
+    pub winners: u32,
+    pub losers: u32,
+    /// Fills whose commission report hasn't arrived yet.
+    pub awaiting_commission: u32,
+    /// The ledger covers the whole period (false when it started recording after `from_day`).
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct LedgerSnapshot {
+    pub account: String,
+    /// Day, Week, Month, Year.
+    pub tallies: Vec<PnlTally>,
+    /// Fills are complete from this day, "YYYYMMDD"; None before the first read.
+    pub recorded_since: Option<String>,
+}
+
+/// IB's live P&L for one position (the whole account position in that contract).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PositionPnl {
+    pub contract_id: i32,
+    /// Current position size (0 once it's closed).
+    pub position: f64,
+    /// Mark-to-market against the average cost (which includes the entry commission).
+    pub unrealized_pnl: Option<f64>,
+    pub daily_pnl: Option<f64>,
+    /// Current market value of the position.
+    pub value: Option<f64>,
 }

@@ -1,5 +1,7 @@
 //! Thin FFI layer over `ibapi` for the IBKR Swift app. See CLAUDE.md for the architecture.
 
+mod latency;
+mod ledger;
 mod options;
 mod orders;
 mod position;
@@ -8,6 +10,7 @@ mod session;
 mod strategy;
 mod types;
 
+pub use ledger::LedgerListener;
 pub use risk::RiskListener;
 pub use session::*;
 pub use strategy::{StrategyHandle, StrategyListener};

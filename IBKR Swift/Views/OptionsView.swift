@@ -130,6 +130,16 @@ struct StrategyTicketView: View {
 
     @State private var confirming = false
 
+    // Quick Buy: preset immediate market buy of ATM contracts on the nearest expiry.
+    @AppStorage(QuickBuyKeys.symbol) private var quickSymbol = "SPY"
+    @AppStorage(QuickBuyKeys.quantity) private var quickQuantity = 10
+    @AppStorage(QuickBuyKeys.callShortcut) private var callShortcut = ""
+    @AppStorage(QuickBuyKeys.putShortcut) private var putShortcut = ""
+    /// LIVE only; paper buys straight away.
+    @State private var quickConfirm: QuickBuyRequest?
+    /// Blocks re-presses (double-clicks, held shortcut keys) for a moment.
+    @State private var quickBusy = false
+
     private var underlyingLast: Double? { store.underlyingQuote?.last }
 
     private var optionSpec: OptionSpec? {
@@ -160,8 +170,18 @@ struct StrategyTicketView: View {
         }
     }
 
+    /// The ticket's exits; nil when a value is invalid. Shared with Quick Buy.
+    private var exits: (takeProfit: Target?, stopLoss: StopSpec?, eodClose: String?)? {
+        if tpMode != .off && (tpValue ?? 0) <= 0 { return nil }
+        if slMode != .off && (slValue ?? 0) <= 0 { return nil }
+        let stopLoss = target(slMode, slValue).map {
+            StopSpec(target: $0, kind: stopLimit ? .stopLimit(limitOffset: limitOffset ?? 0) : .stopMarket)
+        }
+        return (target(tpMode, tpValue), stopLoss, closeAtEnabled ? closeAt.trimmingCharacters(in: .whitespaces) : nil)
+    }
+
     private var spec: StrategySpec? {
-        guard let option = optionSpec, quantity > 0 else { return nil }
+        guard let option = optionSpec, quantity > 0, let exits else { return nil }
         var trigger: Trigger?
         if triggerMode != .immediately {
             guard let triggerPrice, triggerPrice > 0 else { return nil }
@@ -169,20 +189,137 @@ struct StrategyTicketView: View {
                               direction: triggerMode == .risesTo ? .risesTo : .fallsTo,
                               price: triggerPrice)
         }
-        if tpMode != .off && (tpValue ?? 0) <= 0 { return nil }
-        if slMode != .off && (slValue ?? 0) <= 0 { return nil }
-        let stopLoss = target(slMode, slValue).map {
-            StopSpec(target: $0, kind: stopLimit ? .stopLimit(limitOffset: limitOffset ?? 0) : .stopMarket)
-        }
         return StrategySpec(
             option: option,
             quantity: Double(quantity),
             trigger: trigger,
-            takeProfit: target(tpMode, tpValue),
-            stopLoss: stopLoss,
-            eodClose: closeAtEnabled ? closeAt.trimmingCharacters(in: .whitespaces) : nil,
+            takeProfit: exits.takeProfit,
+            stopLoss: exits.stopLoss,
+            eodClose: exits.eodClose,
             allowDelayed: !store.isLive && allowDelayed
         )
+    }
+
+    // MARK: Quick Buy
+
+    private var quickSymbolNormalized: String { quickSymbol.trimmingCharacters(in: .whitespaces).uppercased() }
+
+    /// The loaded chain is the preset's underlying.
+    private var quickChainReady: Bool { store.chain?.symbol.uppercased() == quickSymbolNormalized }
+
+    /// Strike nearest the underlying's last price.
+    private var quickStrike: Double? {
+        guard quickChainReady, let strikes = store.chain?.strikes, let last = underlyingLast else { return nil }
+        return strikes.min { abs($0 - last) < abs($1 - last) }
+    }
+
+    private var quickExpiry: String? { quickChainReady ? store.chain?.expirations.first : nil }
+
+    /// Immediate market buy of `quickQuantity` ATM contracts on the nearest expiry, with the ticket's exits.
+    private func quickSpec(_ right: OptionRight) -> StrategySpec? {
+        guard let chain = store.chain, let expiry = quickExpiry, let strike = quickStrike,
+              quickQuantity > 0, let exits else { return nil }
+        return StrategySpec(
+            option: OptionSpec(symbol: chain.symbol, expiry: expiry, right: right, strike: strike),
+            quantity: Double(quickQuantity),
+            trigger: nil,
+            takeProfit: exits.takeProfit,
+            stopLoss: exits.stopLoss,
+            eodClose: exits.eodClose,
+            allowDelayed: false
+        )
+    }
+
+    /// Cost is checked by the Rust side at the ask when the entry is sent.
+    private var quickRiskProblem: String? { store.entryProblem(cost: nil, requirePrice: false) }
+
+    private var quickDisabled: Bool {
+        quickBusy || quickRiskProblem != nil || quickSpec(.call) == nil || store.connection != .connected
+    }
+
+    private func quickBuy(_ right: OptionRight) {
+        guard !quickBusy, quickRiskProblem == nil, let spec = quickSpec(right) else { return }
+        quickBusy = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            quickBusy = false
+        }
+        if store.isLive {
+            quickConfirm = QuickBuyRequest(spec: spec)
+        } else {
+            sendQuick(spec)
+        }
+    }
+
+    private func sendQuick(_ spec: StrategySpec) {
+        store.arm(spec)
+        store.post(Toast(title: "Quick Buy sent", detail: "BUY \(contractLabel(spec)) at market", tone: .info))
+    }
+
+    private func contractLabel(_ s: StrategySpec) -> String {
+        let o = s.option
+        let dte = Eastern.dte(o.expiry).map { "\($0)DTE" } ?? o.expiry
+        return "\(Int(s.quantity)) \(o.symbol) \(dte) \(o.strike.formatted())\(o.right == .call ? "C" : "P")"
+    }
+
+    @ViewBuilder
+    private var quickBuySection: some View {
+        Section {
+            if quickChainReady {
+                HStack {
+                    quickButton(.call, shortcut: callShortcut)
+                    quickButton(.put, shortcut: putShortcut)
+                }
+                .controlSize(.large)
+                Group {
+                    if let strike = quickStrike, let expiry = quickExpiry {
+                        Text("\(quickSymbolNormalized) \(Eastern.expiryLabel(expiry)) · \(strike.formatted()) strike · market · exits from the ticket below")
+                    } else {
+                        Text("Waiting for \(quickSymbolNormalized)'s last price…")
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                if exits == nil {
+                    Text("Fix the ticket's exit values first.").font(.caption).foregroundStyle(.red)
+                }
+            } else {
+                Button("Load \(quickSymbolNormalized)") {
+                    underlying = quickSymbolNormalized
+                    Task { await loadChain() }
+                }
+                .disabled(store.loadingChain || quickSymbolNormalized.isEmpty)
+                .frame(maxWidth: .infinity)
+            }
+            if let quickRiskProblem {
+                Label(quickRiskProblem, systemImage: "hand.raised.fill").font(.callout).foregroundStyle(.red)
+            }
+        } header: {
+            HStack {
+                Text("Quick Buy")
+                Spacer()
+                SettingsLink { Text("Presets & Shortcuts…") }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+        }
+    }
+
+    private func quickButton(_ right: OptionRight, shortcut raw: String) -> some View {
+        let shortcut = Shortcut.decode(raw)
+        let title = "Buy \(quickQuantity) ATM \(right == .call ? "Call" : "Put")"
+        return Button {
+            quickBuy(right)
+        } label: {
+            VStack(spacing: 2) {
+                Text(title).bold()
+                if let shortcut { Text(shortcut.display).font(.caption2).opacity(0.8) }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(right == .call ? .green : .red)
+        .disabled(quickDisabled)
+        .quickBuyShortcut(shortcut)
     }
 
     private var simulationInput: SimulationInput? {
@@ -215,6 +352,8 @@ struct StrategyTicketView: View {
 
     var body: some View {
         Form {
+            quickBuySection
+
             Section("Contract") {
                 HStack {
                     TextField("Underlying", text: $underlying)
@@ -320,6 +459,9 @@ struct StrategyTicketView: View {
         } message: { spec in
             Text(summary(spec))
         }
+        .sheet(item: $quickConfirm) { request in
+            QuickBuyConfirmSheet(summary: summary(request.spec)) { sendQuick(request.spec) }
+        }
     }
 
     private var confirmTitle: String {
@@ -377,10 +519,14 @@ struct StrategyTicketView: View {
         } ?? "none"
         lines.append("Take profit \(tp) · Stop \(sl)")
         if let eod = s.eodClose { lines.append("Close at \(eod) ET") }
-        if let q = store.optionQuote, let ask = q.ask {
+        // `optionQuote` is the ticket's contract; a Quick Buy may be a different one.
+        if s.option == optionSpec, let q = store.optionQuote, let ask = q.ask {
             let mid = q.bid.map { ($0 + ask) / 2 } ?? ask
             lines.append("Est. cost \((ask * s.quantity * mult).formatted(.currency(code: "USD"))) (ask \(ask.formatted()))\(q.delayed ? " — delayed quote" : "")")
             lines.append("Exits are priced from the actual fill (now ≈ \(mid.formatted()))")
+        } else {
+            lines.append("Cost is checked against your limits at the ask when sent")
+            lines.append("Exits are priced from the actual fill")
         }
         if s.allowDelayed { lines.append("⚠︎ Trigger may fire on DELAYED data") }
         lines.append("")

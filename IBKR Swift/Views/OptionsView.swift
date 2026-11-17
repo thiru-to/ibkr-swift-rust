@@ -16,8 +16,12 @@ struct OptionsView: View {
 
     var body: some View {
         HSplitView {
-            StrategyTicketView(simulation: $simulation)
-                .frame(minWidth: 340, idealWidth: 380, maxWidth: 460)
+            VStack(alignment: .leading, spacing: 0) {
+                SectionHeading(title: "Strategy builder", icon: "scope", tint: .purple)
+                    .padding(.horizontal, 20).padding(.top, 20)
+                StrategyTicketView(simulation: $simulation)
+            }
+                .frame(minWidth: 340, idealWidth: 360, maxWidth: 380, minHeight: 0, maxHeight: .infinity)
             VStack(spacing: 0) {
                 PnLSimulatorView(input: simulation)
                     .frame(minHeight: 300, maxHeight: 480)
@@ -443,6 +447,8 @@ struct StrategyTicketView: View {
                 Button(triggerMode == .immediately ? "Review Buy…" : "Review & Arm…") { confirming = true }
                     .disabled(spec == nil || triggerProblem != nil || riskProblem != nil)
                     .frame(maxWidth: .infinity, alignment: .trailing)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
             }
         }
         .formStyle(.grouped)

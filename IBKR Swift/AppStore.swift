@@ -64,6 +64,12 @@ final class AppStore {
     private(set) var summary: AccountSummary?
     private(set) var positions: [Position] = []
     private(set) var quote: Quote?
+    private(set) var quoteInstrument: Instrument?
+    private(set) var historyError: String?
+    private(set) var quoteTradeBusy = false
+    private(set) var quoteTradeStatus: String?
+    private(set) var quoteTradeLocked = false
+    @ObservationIgnored private var quoteGeneration = UUID()
     /// Price bars for the Quote screen's chart.
     private(set) var history: [PriceBar] = []
     private(set) var loadingHistory = false
@@ -122,10 +128,12 @@ final class AppStore {
     /// The latest history request; older answers are dropped.
     @ObservationIgnored private var historyRequest = 0
     /// What `history` holds, for paging back.
-    @ObservationIgnored private var historyKey: (symbol: String, range: ChartRange, interval: BarInterval)?
+    @ObservationIgnored private var historyKey: (instrument: Instrument, range: ChartRange, interval: BarInterval)?
+    @ObservationIgnored private var historyLoadedAt: ContinuousClock.Instant?
     /// IB had nothing older (or failed); stop paging until the next fresh load.
     @ObservationIgnored private var historyExhausted = false
     @ObservationIgnored private var lastOlderHistory: ContinuousClock.Instant?
+    @ObservationIgnored private var chartLevelsCache: [String: (Date, ChartSessionLevels)] = [:]
     /// Group and fill per order id from the previous snapshot; nil until the first one,
     /// which is the baseline (no toasts for orders that were already done).
     @ObservationIgnored private var orderMemory: [String: (group: OrderStatusGroup, filled: Double)]?
@@ -208,8 +216,17 @@ final class AppStore {
         linkProblem = nil
         summary = nil
         positions = []
+        quoteGeneration = UUID()
+        quoteInstrument = nil
         quote = nil
+        historyRequest += 1
+        historyKey = nil
+        historyLoadedAt = nil
+        loadingHistory = false
+        loadingOlderHistory = false
+        historyError = nil
         history = []
+        chartLevelsCache.removeAll()
         ticketQuote = nil
         positionQuote = nil
         watched.removeAll()
@@ -242,7 +259,16 @@ final class AppStore {
             update: { [weak self] in self?.riskChanged($0) },
             fail: { [weak self] in self?.lastError = $0 }
         ))
-        latencyLog = session.openLatencyLog(path: Self.latencyPath(account: account))
+        let latencyPath = Self.latencyPath(account: account)
+        // Reading and decoding an account's accumulated log must not stall the first frame.
+        Task { [weak self] in
+            let saved = await Task.detached(priority: .utility) {
+                session.openLatencyLog(path: latencyPath)
+            }.value
+            guard let self, self.session === session else { return }
+            let savedIDs = Set(saved.map(\.id))
+            self.latencyLog = saved + self.latencyLog.filter { !savedIDs.contains($0.id) }
+        }
         streams["ledger"] = session.subscribeLedger(statePath: Self.ledgerPath(account: account), listener: LedgerSink(
             update: { [weak self] in self?.ledger = $0 },
             fail: { [weak self] in self?.lastError = $0 }
@@ -277,6 +303,7 @@ final class AppStore {
         case .lost:
             linkProblem = message
         case .restored, .restoredDataLost:
+            historyLoadedAt = nil
             if linkProblem != nil {
                 post(Toast(title: "Connection restored", detail: "Orders and positions reloaded from IB.", tone: .success))
             }
@@ -292,6 +319,7 @@ final class AppStore {
         for (key, symbol) in watched {
             streams[key] = session.subscribeQuote(symbol: symbol, listener: quoteSink(key))
         }
+        if let quoteInstrument { subscribeQuoteInstrument(quoteInstrument) }
         if let watchedOption { watchOption(watchedOption) }
         if let watchedContract { watchPosition(contractId: watchedContract) }
     }
@@ -393,42 +421,99 @@ final class AppStore {
     func refreshSummary() async {
         guard let session else { return }
         do {
-            summary = try await session.accountSummary()
+            let summary = try await session.accountSummary()
+            guard self.session === session else { return }
+            self.summary = summary
         } catch {
+            guard self.session === session else { return }
             report(error)
         }
     }
 
-    func watchQuote(symbol: String) {
-        let symbol = symbol.trimmingCharacters(in: .whitespaces).uppercased()
-        guard let session, !symbol.isEmpty else { return }
-        streams["quote"]?.cancel()
-        quote = Quote(symbol: symbol, bid: nil, ask: nil, last: nil, close: nil,
-                      bidSize: nil, askSize: nil, volume: nil, delayed: false)
-        watched["quote"] = symbol
-        streams["quote"] = session.subscribeQuote(symbol: symbol, listener: quoteSink("quote"))
+    func searchInstruments(_ query: String) async throws -> InstrumentSearchResults {
+        guard let session else { throw ActionError( "Connect to IB Gateway to search.") }
+        do { return try await session.searchInstruments(query: query) }
+        catch { throw ActionError( message(error)) }
     }
 
-    /// Loads chart bars for `symbol`. Answers to superseded requests are ignored.
-    func loadHistory(symbol: String, range: ChartRange, interval: BarInterval) async {
-        let symbol = symbol.trimmingCharacters(in: .whitespaces).uppercased()
-        guard let session, !symbol.isEmpty else { return }
+    func searchChains(_ underlying: Instrument) async throws -> [SearchChain] {
+        guard let session else { throw ActionError( "Gateway disconnected.") }
+        do { return try await session.searchOptionChains(underlying: underlying) }
+        catch { throw ActionError( message(error)) }
+    }
+
+    func searchContracts(_ underlying: Instrument, chain: SearchChain, expiry: String, call: Bool) async throws -> [Instrument] {
+        guard let session else { throw ActionError( "Gateway disconnected.") }
+        do { return try await session.searchOptionContracts(underlying: underlying, chain: chain, expiry: expiry, call: call) }
+        catch { throw ActionError( message(error)) }
+    }
+
+    func watchInstrument(_ instrument: Instrument) {
+        guard session != nil else { return }
+        quoteInstrument = instrument
         historyRequest += 1
-        let request = historyRequest
-        historyKey = (symbol, range, interval)
-        historyExhausted = false
-        loadingHistory = true
-        do {
-            let bars = try await session.priceHistory(symbol: symbol, range: range, interval: interval, end: nil)
-            guard request == historyRequest else { return }
-            history = bars
-        } catch {
-            guard request == historyRequest else { return }
-            history = []
-            report(error)
-        }
+        historyKey = nil
+        historyLoadedAt = nil
+        history = []
+        historyError = nil
         historySeries += 1
         loadingHistory = false
+        loadingOlderHistory = false
+        lastOlderHistory = nil
+        quote = Quote(symbol: instrument.localSymbol.isEmpty ? instrument.symbol : instrument.localSymbol,
+                      bid: nil, ask: nil, last: nil, close: nil, bidSize: nil, askSize: nil, volume: nil, delayed: false)
+        subscribeQuoteInstrument(instrument)
+    }
+
+    private func subscribeQuoteInstrument(_ instrument: Instrument) {
+        guard let session else { return }
+        streams["quote"]?.cancel()
+        quoteGeneration = UUID()
+        let generation = quoteGeneration
+        streams["quote"] = session.subscribeInstrumentQuote(instrument: instrument, listener: QuoteSink(
+            update: { [weak self] q in
+                guard self?.quoteGeneration == generation else { return }
+                self?.quote = q
+            }, fail: { [weak self] error in
+                guard self?.quoteGeneration == generation else { return }
+                self?.lastError = error
+            }))
+    }
+
+    func loadHistory(instrument: Instrument, range: ChartRange, interval: BarInterval) async {
+        guard let session else { return }
+        // A quick trip to another screen should not blank the chart or repeat an IB request.
+        if let key = historyKey, key.instrument == instrument, key.range == range, key.interval == interval,
+           let loaded = historyLoadedAt, ContinuousClock.now - loaded < .seconds(60), !history.isEmpty {
+            return
+        }
+        historyRequest += 1
+        let request = historyRequest
+        historyKey = (instrument, range, interval)
+        historyLoadedAt = nil
+        historyExhausted = false
+        loadingOlderHistory = false
+        historyError = nil
+        loadingHistory = true
+        history = []
+        defer {
+            if request == historyRequest {
+                historySeries += 1
+                loadingHistory = false
+            }
+        }
+        do {
+            let bars = try await session.instrumentHistory(instrument: instrument, range: range, interval: interval, end: nil)
+            guard request == historyRequest else { return }
+            guard !Task.isCancelled else { return }
+            history = bars
+            historyLoadedAt = .now
+            if bars.isEmpty { historyError = "No historical data available for this instrument." }
+        } catch {
+            guard request == historyRequest else { return }
+            guard !Task.isCancelled else { return }
+            historyError = message(error)
+        }
     }
 
     /// Prepends the page of bars before the oldest one shown. Paced well inside IB's
@@ -442,9 +527,9 @@ final class AppStore {
         lastOlderHistory = now
         let request = historyRequest
         loadingOlderHistory = true
-        defer { loadingOlderHistory = false }
+        defer { if request == historyRequest { loadingOlderHistory = false } }
         do {
-            let older = try await session.priceHistory(symbol: key.symbol, range: key.range,
+            let older = try await session.instrumentHistory(instrument: key.instrument, range: key.range,
                                                        interval: key.interval, end: oldest.time)
             guard request == historyRequest else { return }
             if older.isEmpty { historyExhausted = true } else { history = older + history }
@@ -453,6 +538,29 @@ final class AppStore {
             // Typically IB's "no data" at the start of a stock's history.
             historyExhausted = true
             report(error)
+        }
+    }
+
+    /// Reuses session data across indicator toggles and chart interval changes.
+    func chartSessionLevels(instrument: Instrument, sessionTime: Int64) async throws -> ChartSessionLevels {
+        guard let session else { throw ActionError("Connect to IB Gateway to load indicators.") }
+        let key = "\(instrument.contractId)|\(sessionTime)"
+        if let (loaded, levels) = chartLevelsCache[key] {
+            let historical = sessionTime < ChartSessionClock.startOfDay(.now)
+            if Date.now.timeIntervalSince(loaded) < 60 ||
+                (historical && levels.intradayError == nil && levels.previousDayError == nil) {
+                return levels
+            }
+        }
+        do {
+            let levels = try await session.chartSessionLevels(instrument: instrument, sessionTime: sessionTime)
+            try Task.checkCancellation()
+            guard self.session === session else { throw ActionError("Gateway disconnected.") }
+            if chartLevelsCache.count >= 24 { chartLevelsCache.removeAll() }
+            chartLevelsCache[key] = (.now, levels)
+            return levels
+        } catch {
+            throw ActionError(message(error))
         }
     }
 
@@ -627,6 +735,30 @@ final class AppStore {
             return "Order #\(placed.orderId) updated (\(placed.status))"
         } catch {
             throw ActionError(message(error))
+        }
+    }
+
+    func submitQuoteTrade(_ request: InstrumentOrderRequest, closeQuantity: Double?, closing: Bool, reviewedAccount: String, reviewedLive: Bool) async {
+        guard let session, connection == .connected, linkProblem == nil,
+              !quoteTradeBusy, !quoteTradeLocked,
+              account == reviewedAccount, isLive == reviewedLive,
+              quoteInstrument?.contractId == request.instrument.contractId else { return }
+        quoteTradeBusy = true
+        quoteTradeLocked = true
+        quoteTradeStatus = closing ? "Cancelling working orders and closing…" : "Submitting…"
+        Task { try? await Task.sleep(for: .seconds(2)); quoteTradeLocked = false }
+        defer { quoteTradeBusy = false }
+        do {
+            let placed: PlacedOrder
+            if closing {
+                placed = try await session.closePositionMarket(contractId: request.instrument.contractId, expectedQuantity: reviewedLive ? closeQuantity : nil)
+            } else {
+                placed = try await session.placeInstrumentOrder(request: request)
+            }
+            quoteTradeStatus = "\(request.instrument.symbol) · \(placed.orderId > 0 ? "Order #\(placed.orderId): " : "")\(placed.status). \(placed.message)"
+            post(Toast(title: closing ? "Close submitted" : "Order submitted", detail: quoteTradeStatus ?? "", tone: .info))
+        } catch {
+            quoteTradeStatus = message(error)
         }
     }
 

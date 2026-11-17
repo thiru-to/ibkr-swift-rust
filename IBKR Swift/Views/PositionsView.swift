@@ -39,7 +39,8 @@ struct PositionsView: View {
         .monospacedDigit()
         .overlay {
             if store.positions.isEmpty {
-                ContentUnavailableView("No Positions", systemImage: "tray")
+                WorkspaceEmptyState(title: "No open positions", icon: "tray",
+                                    description: "Your holdings will appear here as they’re reported by IB Gateway.", tint: .teal)
             }
         }
         .sheet(item: $details) { target in

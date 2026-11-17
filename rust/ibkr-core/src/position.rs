@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use ibapi::Client;
 use ibapi::accounts::PositionUpdate;
-use ibapi::contracts::{Contract, SecurityType};
+use ibapi::contracts::Contract;
 use ibapi::orders::{Action, CancelOrder, OcaType, Order, OrderData, Orders, order_builder};
 use ibapi::subscriptions::{SubscriptionItem, SubscriptionItemStreamExt};
 
@@ -74,13 +74,8 @@ pub(crate) async fn working_orders(client: &Client, contract_id: Option<i32>) ->
 }
 
 /// The account's current position in the contract, straight from IB (0 if flat).
-async fn current_position(client: &Client, account: &str, contract_id: i32) -> Result<f64, IbkrError> {
+pub(crate) async fn current_position(client: &Client, account: &str, contract_id: i32) -> Result<f64, IbkrError> {
     position_where(client, account, |c| c.contract_id == contract_id).await
-}
-
-/// The account's current stock position in `symbol`, straight from IB (0 if flat).
-pub(crate) async fn stock_position(client: &Client, account: &str, symbol: &str) -> Result<f64, IbkrError> {
-    position_where(client, account, |c| c.security_type == SecurityType::Stock && c.symbol == symbol).await
 }
 
 async fn position_where(client: &Client, account: &str, matches: impl Fn(&Contract) -> bool) -> Result<f64, IbkrError> {
@@ -104,6 +99,7 @@ async fn position_where(client: &Client, account: &str, matches: impl Fn(&Contra
 
 /// The quantity must still be what the user reviewed, or the order would be wrong.
 fn check_quantity(actual: f64, expected: f64) -> Result<(), IbkrError> {
+    if !actual.is_finite() || !expected.is_finite() || expected == 0.0 { return Err(invalid("Position quantities must be finite and the reviewed quantity nonzero.")); }
     if actual == 0.0 {
         return Err(invalid("The position is already flat. Nothing was sent."));
     }
@@ -147,11 +143,16 @@ async fn cancel_confirmed(client: &Client, d: &OrderData) -> Result<(), String> 
 /// user reviewed (bid − cap to sell, ask + cap to buy); it's rounded to a valid tick,
 /// toward filling.
 pub(crate) async fn close(ctx: Ctx<'_>, contract_id: i32, expected_quantity: f64, limit_price: f64) -> Result<PlacedOrder, IbkrError> {
-    if !(limit_price.is_finite() && limit_price > 0.0) {
+    close_order(ctx, contract_id, Some(expected_quantity), Some(limit_price)).await
+}
+
+pub(crate) async fn close_order(ctx: Ctx<'_>, contract_id: i32, expected_quantity: Option<f64>, limit_price: Option<f64>) -> Result<PlacedOrder, IbkrError> {
+    if limit_price.is_some_and(|p| !(p.is_finite() && p > 0.0)) {
         return Err(invalid("limit price must be greater than 0"));
     }
+    if expected_quantity.is_some_and(|q| !q.is_finite() || q == 0.0) { return Err(invalid("Review a nonzero finite position quantity.")); }
     let resolved = options::resolve_contract_id(ctx.client, contract_id).await?;
-    let working = working_orders(ctx.client, Some(contract_id)).await?;
+    let working: Vec<_> = working_orders(ctx.client, Some(contract_id)).await?.into_iter().filter(|d| d.order.account == ctx.account || d.order.account.is_empty()).collect();
     if working.iter().any(|d| ctx.strategy_owns(d.order_id) && d.order.client_id == ctx.client_id) {
         return Err(invalid("A running strategy manages this position. Close it with the strategy's Close Now so its exits stay in one OCA group."));
     }
@@ -171,12 +172,24 @@ pub(crate) async fn close(ctx: Ctx<'_>, contract_id: i32, expected_quantity: f64
         cancelled.push(format!("#{}", d.order_id));
     }
 
+    if !working_orders(ctx.client, Some(contract_id)).await?.into_iter().filter(|d| d.order.account == ctx.account || d.order.account.is_empty()).collect::<Vec<_>>().is_empty() {
+        return Err(api(nothing_closed(&"Working orders remain on the contract; review them before closing", &cancelled)));
+    }
     let quantity = current_position(ctx.client, ctx.account, contract_id).await.map_err(|e| api(nothing_closed(&e, &cancelled)))?;
-    check_quantity(quantity, expected_quantity).map_err(|e| api(nothing_closed(&e, &cancelled)))?;
+    if !quantity.is_finite() { return Err(invalid("IB returned an invalid position quantity; nothing was sent.")); }
+    if quantity == 0.0 && limit_price.is_none() {
+        return Ok(PlacedOrder { order_id: 0, status: "Flat".into(), message: "Position is already flat; no market order sent.".into() });
+    }
+    if let Some(expected) = expected_quantity {
+        check_quantity(quantity, expected).map_err(|e| api(nothing_closed(&e, &cancelled)))?;
+    }
 
     let action = if quantity > 0.0 { Action::Sell } else { Action::Buy };
-    let price = tick(limit_price, &resolved, if action == Action::Sell { Round::Down } else { Round::Up });
-    let mut order = order_builder::limit_order(action, quantity.abs(), price);
+    let mut order = match limit_price {
+        Some(price) => order_builder::limit_order(action, quantity.abs(), tick(price, &resolved, if action == Action::Sell { Round::Down } else { Round::Up })),
+        None => order_builder::market_order(action, quantity.abs()),
+    };
+    order.account = ctx.account.into();
     order.tif = ibapi::orders::TimeInForce::Day;
     let order_id = ctx.client.next_order_id();
     crate::orders::note_submit(order_id);
@@ -326,6 +339,13 @@ fn tick(price: f64, c: &ResolvedContract, dir: Round) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_review_rejects_nonfinite_quantities() {
+        assert!(check_quantity(25.0, f64::NAN).is_err());
+        assert!(check_quantity(f64::INFINITY, 25.0).is_err());
+        assert!(check_quantity(-100.0, -100.0).is_ok());
+    }
 
     #[test]
     fn protection_prices_must_bracket_the_position() {

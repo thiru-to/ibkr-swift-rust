@@ -18,11 +18,11 @@ struct RiskSection: View {
     @State private var problem: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Risk").font(.headline)
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeading(title: "Risk controls", icon: "shield.lefthalf.filled", tint: .teal)
             if let risk = store.risk {
                 content(risk)
-                    .card()
+                    .card(tint: .teal)
                     .onAppear { load(risk) }
             } else {
                 Text("Starting…").foregroundStyle(.secondary).card()
@@ -31,7 +31,7 @@ struct RiskSection: View {
     }
 
     private func content(_ risk: RiskStatus) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
                 if let reason = risk.halted {
                     Pill(text: "HALTED", color: .red, solid: true)
@@ -43,7 +43,7 @@ struct RiskSection: View {
                 HaltButton()
             }
 
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 12) {
                 GridRow {
                     Text("Today's P&L (IB)").foregroundStyle(.secondary)
                     Text(risk.dailyPnl.money("USD")).foregroundStyle(pnlColor(risk.dailyPnl))
@@ -63,6 +63,7 @@ struct RiskSection: View {
                 }
             }
             .monospacedDigit()
+            .textFieldStyle(.roundedBorder)
 
             if let pending = risk.pending {
                 Label("From the next trading day: max daily loss \(describe(pending.maxDailyLoss)), max cost per trade \(describe(pending.maxCostPerTrade)).",

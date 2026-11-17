@@ -17,13 +17,13 @@ struct IBKR_SwiftApp: App {
         WindowGroup {
             ContentView()
                 .environment(store)
-                .frame(minWidth: 820, minHeight: 520)
+                .frame(minWidth: 1080, minHeight: 640)
                 .onAppear {
                     appDelegate.store = store
                     store.startAutoConnect()
                 }
         }
-        .defaultSize(width: 1000, height: 640)
+        .defaultSize(width: 1240, height: 780)
         .commands {
             CommandMenu("Account") {
                 @Bindable var store = store

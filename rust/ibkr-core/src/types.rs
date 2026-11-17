@@ -71,6 +71,29 @@ pub struct PriceBar {
     pub volume: f64,
 }
 
+/// High/low trade prices for a session window; absent when IB has no trades.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ChartPriceRange {
+    pub high: f64,
+    pub low: f64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChartSessionLevels {
+    /// ISO calendar dates in America/New_York.
+    pub session_date: String,
+    pub previous_session_date: Option<String>,
+    pub premarket: Option<ChartPriceRange>,
+    /// Only published once the full opening window has elapsed.
+    pub orb15: Option<ChartPriceRange>,
+    pub orb30: Option<ChartPriceRange>,
+    pub previous_day: Option<ChartPriceRange>,
+    pub as_of: i64,
+    /// Independent errors allow previous-day levels to survive an intraday failure.
+    pub intraday_error: Option<String>,
+    pub previous_day_error: Option<String>,
+}
+
 /// How far back a price chart reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ChartRange {
@@ -469,4 +492,41 @@ pub struct PositionPnl {
     pub daily_pnl: Option<f64>,
     /// Current market value of the position.
     pub value: Option<f64>,
+}
+
+/// A qualified instrument; exchange and currency remain part of its identity.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Instrument {
+    pub contract_id: i32,
+    pub symbol: String,
+    pub local_symbol: String,
+    pub name: String,
+    pub kind: String,
+    pub exchange: String,
+    pub primary_exchange: String,
+    pub currency: String,
+    pub has_options: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchChain {
+    pub exchange: String,
+    pub trading_class: String,
+    pub multiplier: String,
+    pub expirations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct InstrumentSearchResults {
+    pub instruments: Vec<Instrument>,
+    pub unavailable_indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InstrumentOrderRequest {
+    pub instrument: Instrument,
+    pub side: OrderSide,
+    pub quantity: f64,
+    pub kind: OrderKind,
+    pub tif: TimeInForce,
 }

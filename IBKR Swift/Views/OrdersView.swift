@@ -13,8 +13,12 @@ import SwiftUI
 struct OrdersView: View {
     var body: some View {
         HSplitView {
-            OrderTicketView()
-                .frame(minWidth: 280, idealWidth: 300, maxWidth: 360)
+            VStack(alignment: .leading, spacing: 0) {
+                SectionHeading(title: "New order", icon: "square.and.pencil", tint: .orange)
+                    .padding(.horizontal, 20).padding(.top, 20)
+                OrderTicketView()
+            }
+                .frame(minWidth: 280, idealWidth: 300, maxWidth: 320)
             OrderListView()
                 .frame(minWidth: 420)
         }
@@ -431,40 +435,31 @@ struct OrderListView: View {
     @State private var selection: OrderInfo.ID?
     @State private var detail: OrderRef?
 
-    private func count(_ f: OrderFilter) -> Int {
-        guard let group = f.group else { return store.orders.count }
-        return store.orders.filter { $0.group == group }.count
-    }
-
-    private var shown: [OrderInfo] {
-        guard let group = filter.group else { return store.orders }
-        return store.orders.filter { $0.group == group }
-    }
-
     var body: some View {
+        // Group once per snapshot, rather than scanning the order book for every filter label.
+        let groups = Dictionary(grouping: store.orders, by: \.group)
+        let counts = groups.mapValues(\.count)
+        let shown = filter.group.map { groups[$0] ?? [] } ?? store.orders
         VStack(spacing: 0) {
             PnLTallyView()
             Divider()
-            HStack {
-                Picker("Status", selection: $filter) {
-                    // "Other" only when IB sent a status ibapi doesn't model.
-                    ForEach(OrderFilter.allCases.filter { $0 != .other || count(.other) > 0 }, id: \.self) { f in
-                        Text("\(f.title) (\(count(f)))").tag(f)
-                    }
+            HStack(spacing: 12) {
+                ViewThatFits(in: .horizontal) {
+                    statusPicker(counts: counts)
+                        .pickerStyle(.segmented)
+                        .fixedSize(horizontal: true, vertical: false)
+                    statusPicker(counts: counts).pickerStyle(.menu)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
                 Button("Refresh", systemImage: "arrow.clockwise") { store.refreshOrders() }
                     .labelStyle(.iconOnly)
                     .help("Reload open and today's completed orders from IB")
             }
-            .padding(8)
+            .padding(12)
 
             Table(shown, selection: $selection) {
-                TableColumn("ID") { o in Text(o.orderId > 0 ? String(o.orderId) : "—").foregroundStyle(.secondary) }.width(45)
-                TableColumn("Time") { o in Text(time(o.completedTime)).foregroundStyle(.secondary) }.width(65)
                 TableColumn("Symbol") { o in Text(o.displaySymbol).monospaced().fontWeight(.medium) }
-                    .width(min: 90, ideal: 170)
+                    .width(min: 100, ideal: 150)
+                TableColumn("Status") { o in StatusPill(order: o) }.width(min: 100, ideal: 120)
                 TableColumn("Order") { o in
                     HStack(spacing: 4) {
                         Text(o.action.uppercased()).fontWeight(.semibold).foregroundStyle(o.isBuy ? .green : .red)
@@ -475,7 +470,8 @@ struct OrderListView: View {
                 TableColumn("Filled/Qty") { o in Text("\(o.filled.quantity)/\(o.quantity.quantity)") }.width(65)
                 TableColumn("Price") { o in Text(price(o)) }.width(min: 60, ideal: 90)
                 TableColumn("Avg Fill") { o in Text(o.averageFillPrice.formatted(digits: 2)) }.width(60)
-                TableColumn("Status") { o in StatusPill(order: o) }.width(min: 80, ideal: 110)
+                TableColumn("Time") { o in Text(time(o.completedTime)).foregroundStyle(.secondary) }.width(65)
+                TableColumn("ID") { o in Text(o.orderId > 0 ? String(o.orderId) : "—").foregroundStyle(.secondary) }.width(45)
                 TableColumn("Detail") { o in
                     Text(o.detail.replacingOccurrences(of: "\n", with: " "))
                         .foregroundStyle(o.group == .inactive ? .red : .secondary)
@@ -502,10 +498,19 @@ struct OrderListView: View {
             }
             .overlay {
                 if shown.isEmpty {
-                    ContentUnavailableView("No \(filter == .all ? "" : filter.title + " ")Orders", systemImage: "tray")
+                    WorkspaceEmptyState(title: "No \(filter == .all ? "" : filter.title.lowercased() + " ")orders", icon: "tray",
+                        description: "Orders reported by IB Gateway will appear here.", tint: .orange)
                 }
             }
         }
+    }
+
+    private func statusPicker(counts: [OrderStatusGroup: Int]) -> some View {
+        Picker("Status", selection: $filter) {
+            ForEach(OrderFilter.allCases.filter { $0 != .other || counts[.other, default: 0] > 0 }, id: \.self) { f in
+                Text("\(f.title) (\(f.group.map { counts[$0, default: 0] } ?? store.orders.count))").tag(f)
+            }
+        }.labelsHidden()
     }
 
     /// Limit and/or stop, e.g. "1.39", "stp 1.13", "stp 1.13 lmt 1.08".

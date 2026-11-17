@@ -136,6 +136,8 @@ pub struct IbkrSession {
     risk: Arc<RiskGuard>,
     /// Where strategy entries log their fill timing (set by Swift).
     latency: LatencyLog,
+    search: Arc<crate::search::SearchService>,
+    order_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Connects to TWS / IB Gateway. Requests delayed market data as a fallback so quotes
@@ -155,7 +157,7 @@ pub async fn connect(host: String, port: u16, client_id: i32) -> Result<Arc<Ibkr
         let strategy_orders = OwnedOrders::default();
         let live = LIVE_PORTS.contains(&port) || !account.starts_with('D');
         let risk = RiskGuard::new(client.clone(), client_id, strategy_orders.clone(), live);
-        Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk, latency: Default::default() }))
+        Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk, latency: Default::default(), search: Default::default(), order_gate: Default::default() }))
     })
     .await
 }
@@ -205,6 +207,51 @@ impl IbkrSession {
             let on_error = |e: String| listener.on_error(format!("Positions: {e}"));
             keep_streaming(&client, on_error, || stream_positions(&client, listener.as_ref())).await
         })
+    }
+
+    pub async fn search_instruments(&self, query: String) -> Result<InstrumentSearchResults, IbkrError> {
+        let (client, state) = (self.client.clone(), self.search.clone());
+        run(async move { crate::search::search(&client, &state, &query).await }).await
+    }
+
+    pub async fn search_option_chains(&self, underlying: Instrument) -> Result<Vec<SearchChain>, IbkrError> {
+        let client = self.client.clone();
+        run(async move { crate::search::chains(&client, &underlying).await }).await
+    }
+
+    pub async fn search_option_contracts(&self, underlying: Instrument, chain: SearchChain, expiry: String, call: bool) -> Result<Vec<Instrument>, IbkrError> {
+        let client = self.client.clone();
+        run(async move { crate::search::contracts(&client, &underlying, &chain, &expiry, call).await }).await
+    }
+
+    pub fn subscribe_instrument_quote(&self, instrument: Instrument, listener: Arc<dyn QuoteListener>) -> Arc<StreamHandle> {
+        let client = self.client.clone();
+        spawn_stream(async move {
+            let label = if instrument.local_symbol.is_empty() { instrument.symbol.clone() } else { instrument.local_symbol.clone() };
+            if let Err(e) = stream_quote(&client, &crate::search::contract(&instrument), label, listener.as_ref()).await {
+                listener.on_error(e.to_string());
+            }
+        })
+    }
+
+    pub async fn instrument_history(&self, instrument: Instrument, range: ChartRange, interval: BarInterval, end: Option<i64>) -> Result<Vec<PriceBar>, IbkrError> {
+        let client = self.client.clone();
+        run(async move {
+            let contract = crate::search::contract(&instrument);
+            let mut request = client.historical_data(&contract, bar_size(interval)).duration(history_duration(range));
+            if let Some(end) = end {
+                request = request.ending(OffsetDateTime::from_unix_timestamp(end).map_err(|e| invalid(e.to_string()))?);
+            }
+            let data = request.fetch().await?;
+            Ok(data.bars.iter().map(price_bar).filter(|b| end.is_none_or(|end| b.time < end)).collect())
+        }).await
+    }
+
+    /// Independent of the chart interval: minute extended-hours bars for PM/ORB,
+    /// and regular-hours daily bars for the last actual session before this NY date.
+    pub async fn chart_session_levels(&self, instrument: Instrument, session_time: i64) -> Result<ChartSessionLevels, IbkrError> {
+        let client = self.client.clone();
+        run(async move { crate::chart_levels::load(&client, &instrument, session_time).await }).await
     }
 
     pub fn subscribe_quote(&self, symbol: String, listener: Arc<dyn QuoteListener>) -> Arc<StreamHandle> {
@@ -368,7 +415,9 @@ impl IbkrSession {
     /// refuses positions a running strategy manages. See `position.rs`.
     pub async fn close_position(&self, contract_id: i32, expected_quantity: f64, limit_price: f64) -> Result<PlacedOrder, IbkrError> {
         let (client, account, owned, client_id) = self.parts();
+        let gate = self.order_gate.clone();
         run(async move {
+            let _guard = gate.lock().await;
             let ctx = Ctx { client: &client, account: &account, client_id, owned: &owned };
             position::close(ctx, contract_id, expected_quantity, limit_price).await
         })
@@ -385,7 +434,9 @@ impl IbkrSession {
         stop_limit: Option<f64>,
     ) -> Result<Vec<PlacedOrder>, IbkrError> {
         let (client, account, owned, client_id) = self.parts();
+        let gate = self.order_gate.clone();
         run(async move {
+            let _guard = gate.lock().await;
             let ctx = Ctx { client: &client, account: &account, client_id, owned: &owned };
             position::protect(ctx, contract_id, expected_quantity, take_profit, stop, stop_limit).await
         })
@@ -395,7 +446,9 @@ impl IbkrSession {
     /// Changes the limit and/or stop price of a working order this connection placed.
     pub async fn modify_order(&self, order_id: i32, limit_price: Option<f64>, stop_price: Option<f64>) -> Result<PlacedOrder, IbkrError> {
         let (client, account, owned, client_id) = self.parts();
+        let gate = self.order_gate.clone();
         run(async move {
+            let _guard = gate.lock().await;
             let ctx = Ctx { client: &client, account: &account, client_id, owned: &owned };
             position::modify(ctx, order_id, limit_price, stop_price).await
         })
@@ -416,29 +469,53 @@ impl IbkrSession {
     /// `subscribe_orders`.
     pub async fn place_order(&self, request: OrderRequest) -> Result<PlacedOrder, IbkrError> {
         validate_order(&request)?;
-        let (client, account, risk) = (self.client.clone(), self.account.clone(), self.risk.clone());
+        let client = self.client.clone();
+        let symbol = request.symbol.trim().to_uppercase();
+        let details = run(async move { Ok(client.contract_details(&Contract::stock(symbol).build()).await?) }).await?;
+        if details.len() != 1 { return Err(invalid("Symbol is ambiguous; select an exact listing on Quote.")); }
+        let c = &details[0].contract;
+        let instrument = Instrument { contract_id: c.contract_id, symbol: c.symbol.to_string(), local_symbol: c.local_symbol.clone(), name: details[0].long_name.clone(), kind: "STK".into(), exchange: "SMART".into(), primary_exchange: c.primary_exchange.to_string(), currency: c.currency.to_string(), has_options: false };
+        self.place_instrument_order(InstrumentOrderRequest { instrument, side: request.side, quantity: request.quantity, kind: request.kind, tif: request.tif }).await
+    }
+
+    pub async fn close_position_market(&self, contract_id: i32, expected_quantity: Option<f64>) -> Result<PlacedOrder, IbkrError> {
+        let (client, account, owned, client_id) = self.parts();
+        let gate = self.order_gate.clone();
+        let live = self.is_live() || !account.starts_with('D');
         run(async move {
-            let symbol = request.symbol.trim().to_uppercase();
-            let contract = Contract::stock(symbol.clone()).build();
-            match request.side {
-                OrderSide::Buy => {
-                    let price = match request.kind {
-                        OrderKind::Limit { price } => Some(price),
-                        OrderKind::Market if risk.checks_cost() => snapshot_ask(&client, &contract).await,
-                        OrderKind::Market => None,
-                    };
-                    risk.check_entry(price.map(|p| p * request.quantity))?;
-                }
-                // While halted, a sell may close a long but not open a short.
-                OrderSide::Sell if risk.halted().is_some() => {
-                    let held = position::stock_position(&client, &account, &symbol).await?;
-                    if request.quantity > held {
-                        return Err(invalid(format!(
-                            "Trading is halted for today; sells are limited to the {held} {symbol} shares you hold."
-                        )));
-                    }
-                }
-                OrderSide::Sell => {}
+            let _guard = gate.lock().await;
+            if live && expected_quantity.is_none() { return Err(invalid("Live closes require a reviewed quantity.")); }
+            let resolved = options::resolve_contract_id(&client, contract_id).await?;
+            if resolved.contract.security_type != ibapi::contracts::SecurityType::Stock { return Err(invalid("Quote trading supports stocks and ETFs only.")); }
+            position::close_order(Ctx { client: &client, account: &account, client_id, owned: &owned }, contract_id, expected_quantity, None).await
+        }).await
+    }
+
+    pub async fn place_instrument_order(&self, request: InstrumentOrderRequest) -> Result<PlacedOrder, IbkrError> {
+        validate_instrument_order(&request)?;
+        let (client, account, risk, gate) = (self.client.clone(), self.account.clone(), self.risk.clone(), self.order_gate.clone());
+        run(async move {
+            let _guard = gate.lock().await;
+            let resolved = options::resolve_contract_id(&client, request.instrument.contract_id).await?;
+            let contract = resolved.contract;
+            if contract.security_type != ibapi::contracts::SecurityType::Stock { return Err(invalid("Quote trading supports stocks and ETFs only.")); }
+            if contract.currency.to_string() != request.instrument.currency || contract.symbol.to_string() != request.instrument.symbol {
+                return Err(invalid("Instrument changed; search and select it again."));
+            }
+            if let OrderKind::Limit { price } = request.kind {
+                let step = resolved.increments.iter().rev().find(|(low, _)| price >= *low).map(|(_, step)| *step).unwrap_or(0.01);
+                if (price / step - (price / step).round()).abs() > 1e-6 { return Err(invalid(format!("Limit price must use increments of {step}."))); }
+            }
+            let held = position::current_position(&client, &account, contract.contract_id).await?;
+            let working: Vec<_> = position::working_orders(&client, Some(contract.contract_id)).await?.into_iter().filter(|d| d.order.account == account || d.order.account.is_empty()).collect();
+            let opening = opening_quantity(held, request.side, request.quantity, !working.is_empty());
+            if opening > 0.0 {
+                let price = match request.kind {
+                    OrderKind::Limit { price } => Some(price),
+                    OrderKind::Market if risk.checks_cost() => snapshot_ask(&client, &contract).await,
+                    OrderKind::Market => None,
+                };
+                risk.check_entry(price.map(|p| p * opening))?;
             }
             let builder = client.order(&contract);
             let builder = match request.side {
@@ -449,13 +526,14 @@ impl IbkrSession {
                 OrderKind::Market => builder.market(),
                 OrderKind::Limit { price } => builder.limit(price),
             };
-            let order = builder
+            let mut order = builder
                 .time_in_force(match request.tif {
                     TimeInForce::Day => ibapi::orders::TimeInForce::Day,
                     TimeInForce::Gtc => ibapi::orders::TimeInForce::GoodTillCanceled,
                 })
                 .build()
                 .map_err(|e| invalid(e.to_string()))?;
+            order.account = account;
             let order_id = client.next_order_id();
             // Dropping this subscription later does not cancel the order (PlaceOrder has no cancel message).
             crate::orders::note_submit(order_id);
@@ -526,6 +604,20 @@ impl IbkrSession {
     fn parts(&self) -> (Arc<Client>, String, OwnedOrders, i32) {
         (self.client.clone(), self.account.clone(), self.strategy_orders.clone(), self.client_id)
     }
+}
+
+fn validate_instrument_order(request: &InstrumentOrderRequest) -> Result<(), IbkrError> {
+        validate_order(&OrderRequest { symbol: request.instrument.symbol.clone(), side: request.side, quantity: request.quantity, kind: request.kind, tif: request.tif })?;
+        if request.instrument.contract_id <= 0 { return Err(invalid("Select a qualified stock or ETF.")); }
+        if request.quantity.fract() != 0.0 { return Err(invalid("Quantity must be whole shares.")); }
+    Ok(())
+}
+
+/// Pending orders make the amount available to reduce uncertain.
+fn opening_quantity(held: f64, side: OrderSide, quantity: f64, pending: bool) -> f64 {
+    if pending { return quantity; }
+    let reducible = match side { OrderSide::Buy => (-held).max(0.0), OrderSide::Sell => held.max(0.0) };
+    (quantity - reducible).max(0.0)
 }
 
 fn validate_order(r: &OrderRequest) -> Result<(), IbkrError> {
@@ -825,7 +917,7 @@ fn bar_size(interval: BarInterval) -> BarSize {
 /// timezone within ±11h of UTC (midnight UTC is the previous evening in the US).
 const NOON: i64 = 12 * 3600;
 
-fn price_bar(b: &Bar) -> PriceBar {
+pub(crate) fn price_bar(b: &Bar) -> PriceBar {
     let time = match b.date {
         BarTimestamp::Date(d) => d.midnight().assume_utc().unix_timestamp() + NOON,
         BarTimestamp::DateTime(dt) => dt.unix_timestamp(),
@@ -863,6 +955,43 @@ fn apply_size(q: &mut Quote, tick: TickType, size: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instrument_orders_reject_invalid_quantities_and_prices() {
+        let i = Instrument { contract_id: 42, symbol: "RY".into(), local_symbol: "RY".into(), name: "Royal Bank".into(), kind: "STK".into(), exchange: "SMART".into(), primary_exchange: "TSE".into(), currency: "CAD".into(), has_options: true };
+        let mut r = InstrumentOrderRequest { instrument: i, side: OrderSide::Sell, quantity: 25.0, kind: OrderKind::Market, tif: TimeInForce::Day };
+        assert!(validate_instrument_order(&r).is_ok());
+        for qty in [0.0, -25.0, 1.5, f64::NAN, f64::INFINITY] {
+            r.quantity = qty;
+            assert!(validate_instrument_order(&r).is_err());
+        }
+        r.quantity = 25.0;
+        for price in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            r.kind = OrderKind::Limit { price };
+            assert!(validate_instrument_order(&r).is_err());
+        }
+        r.kind = OrderKind::Market;
+        r.instrument.contract_id = 0;
+        assert!(validate_instrument_order(&r).is_err());
+    }
+
+    #[test]
+    fn entries_reductions_and_reversals_include_short_risk() {
+        for (held, side, qty, pending, expected) in [
+            (0.0, OrderSide::Buy, 25.0, false, 25.0),
+            (0.0, OrderSide::Sell, 100.0, false, 100.0),
+            (100.0, OrderSide::Sell, 25.0, false, 0.0),
+            (-100.0, OrderSide::Buy, 25.0, false, 0.0),
+            (100.0, OrderSide::Sell, 250.0, false, 150.0),
+            (-100.0, OrderSide::Buy, 250.0, false, 150.0),
+            (100.0, OrderSide::Buy, 25.0, false, 25.0),
+            (-100.0, OrderSide::Sell, 25.0, false, 25.0),
+            (100.0, OrderSide::Sell, 25.0, true, 25.0),
+            (-100.0, OrderSide::Buy, 25.0, true, 25.0),
+        ] {
+            assert_eq!(opening_quantity(held, side, qty, pending), expected);
+        }
+    }
 
     fn req(qty: f64, kind: OrderKind) -> OrderRequest {
         OrderRequest { symbol: "AAPL".into(), side: OrderSide::Buy, quantity: qty, kind, tif: TimeInForce::Day }

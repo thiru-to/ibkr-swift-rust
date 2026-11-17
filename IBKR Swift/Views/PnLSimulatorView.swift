@@ -32,7 +32,6 @@ struct PnLSimulatorView: View {
     /// User overrides; nil means "use the market / the default".
     @State private var volPercent: Double?
     @State private var hoursAhead: Double?
-    @State private var hoverSpot: Double?
 
     var body: some View {
         Group {
@@ -174,7 +173,49 @@ struct PnLSimulatorView: View {
         }
         let evalName = "At \(Eastern.timeLabel(m.evalDate))"
 
-        return VStack(alignment: .leading, spacing: 10) {
+        return VStack(alignment: .leading, spacing: 12) {
+            SimulationResults(input: input, model: m, samples: samples, evalName: evalName)
+            controls(m)
+        }
+        .padding(AppTheme.pagePadding)
+        .monospacedDigit()
+    }
+
+    private func controls(_ m: Model) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+            GridRow {
+                Text("Time")
+                Slider(value: Binding(get: { m.evalHours }, set: { hoursAhead = $0 }), in: 0...max(m.maxHours, 0.01))
+                Text(Eastern.timeLabel(m.evalDate)).frame(width: 150, alignment: .leading)
+                Button("Reset") { hoursAhead = nil }.disabled(hoursAhead == nil)
+            }
+            GridRow {
+                Text("IV")
+                Slider(value: Binding(get: { m.vol * 100 }, set: { volPercent = $0 }),
+                       in: 1...max(150, (m.marketVol ?? 0) * 300))
+                Text(m.marketVol.map { "market \($0.formatted(.percent.precision(.fractionLength(1))))" } ?? "no market IV")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 150, alignment: .leading)
+                Button("Reset") { volPercent = nil }.disabled(volPercent == nil || m.marketVol == nil)
+            }
+        }
+        .controlSize(.small)
+    }
+}
+
+/// Pointer movement stays inside the results view. IV solving and curve sampling
+/// happen in the parent only when quotes, ticket inputs, or simulation controls change.
+private struct SimulationResults: View {
+    private typealias Model = PnLSimulatorView.Model
+    let input: SimulationInput
+    let model: PnLSimulatorView.Model
+    let samples: [(s: Double, now: Double, expiry: Double)]
+    let evalName: String
+    @State private var hoverSpot: Double?
+
+    var body: some View {
+        let m = model
+        VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text("P/L Simulation").font(.headline)
                 Text("\(Int(input.quantity))× \(input.option.symbol) \(input.option.strike.formatted()) \(m.call ? "C" : "P")")
@@ -190,10 +231,7 @@ struct PnLSimulatorView: View {
             chart(m, samples: samples, evalName: evalName)
                 .frame(minHeight: 220)
 
-            controls(m)
         }
-        .padding()
-        .monospacedDigit()
     }
 
     private func stats(_ m: Model, samples: [(s: Double, now: Double)]) -> some View {
@@ -274,7 +312,7 @@ struct PnLSimulatorView: View {
         }
         .chartForegroundStyleScale(["At expiry": Color.secondary, evalName: Color.accentColor])
         .chartXScale(domain: m.priceRange)
-        .chartXAxisLabel("\(input?.option.symbol ?? "Underlying") price")
+        .chartXAxisLabel("\(input.option.symbol) price")
         .chartYAxisLabel("P/L")
         .chartYAxis {
             AxisMarks(position: .leading) { value in
@@ -303,24 +341,4 @@ struct PnLSimulatorView: View {
         Text(text).font(.caption2.weight(.semibold)).foregroundStyle(color)
     }
 
-    private func controls(_ m: Model) -> some View {
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
-            GridRow {
-                Text("Time")
-                Slider(value: Binding(get: { m.evalHours }, set: { hoursAhead = $0 }), in: 0...max(m.maxHours, 0.01))
-                Text(Eastern.timeLabel(m.evalDate)).frame(width: 150, alignment: .leading)
-                Button("Reset") { hoursAhead = nil }.disabled(hoursAhead == nil)
-            }
-            GridRow {
-                Text("IV")
-                Slider(value: Binding(get: { m.vol * 100 }, set: { volPercent = $0 }),
-                       in: 1...max(150, (m.marketVol ?? 0) * 300))
-                Text(m.marketVol.map { "market \($0.formatted(.percent.precision(.fractionLength(1))))" } ?? "no market IV")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 150, alignment: .leading)
-                Button("Reset") { volPercent = nil }.disabled(volPercent == nil || m.marketVol == nil)
-            }
-        }
-        .controlSize(.small)
-    }
 }

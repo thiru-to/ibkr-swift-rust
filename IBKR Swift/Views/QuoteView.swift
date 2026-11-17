@@ -9,99 +9,117 @@ import SwiftUI
 
 struct QuoteView: View {
     @Environment(AppStore.self) private var store
-    @State private var symbol = "AAPL"
+    @State private var searching = false
+    @State private var searchText = ""
     @State private var range = ChartRange.day
     @State private var interval = BarInterval.min5
     @AppStorage("chartStyle") private var style = PriceChart.Style.line
-    /// The chart fills the pane; the symbol field and quote cards are hidden.
-    @State private var expanded = false
+    @AppStorage("quoteChartIndicators") private var indicators = 0
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 16) {
+                QuoteMarketHeader(searching: $searching, searchText: $searchText)
+                if store.quoteInstrument != nil {
+                    chartControls
+                    QuoteHistoryChart(range: range, interval: interval, style: style, indicators: indicators)
+                    Text("Scroll to zoom · Shift-scroll to pan · Click chart for keyboard controls")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    WorkspaceEmptyState(title: "Find your next instrument", icon: "magnifyingglass",
+                        description: "Search stocks, ETFs, indexes, and options. You can also start typing anywhere on this screen.", tint: .blue)
+                }
+            }
+            // Keep wrapped empty-state text and chart content from inflating the
+            // window's minimum size during NavigationSplitView's sizing pass.
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+            QuoteTradePanel()
+                .frame(width: 260)
+                .padding(16)
+                .background(AppTheme.surface, in: .rect(cornerRadius: AppTheme.cardRadius))
+                .overlay(RoundedRectangle(cornerRadius: AppTheme.cardRadius).strokeBorder(AppTheme.border).allowsHitTesting(false))
+        }
+        .padding(AppTheme.pagePadding)
+        .navigationTitle("Quote")
+        .background(QuoteKeyboardInput(isSearching: searching) { characters in
+            if searching { searchText += characters } else { searchText = characters }
+            searching = true
+        })
+        .sheet(isPresented: $searching) {
+            InstrumentSearchView(query: $searchText) { instrument in
+                store.watchInstrument(instrument)
+                searching = false
+            }
+        }
+    }
+
+    private var chartControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Picker("Range", selection: $range) {
+                    ForEach(ChartRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                Picker("Interval", selection: $interval) {
+                    ForEach(range.intervals, id: \.self) { Text($0.label).tag($0) }
+                }
+                Picker("Style", selection: $style) {
+                    Image(systemName: "chart.xyaxis.line").help("Line chart").tag(PriceChart.Style.line)
+                    Image(systemName: "chart.bar.xaxis").help("Candlestick chart").tag(PriceChart.Style.candles)
+                }.frame(width: 80)
+            }
+            .pickerStyle(.segmented).labelsHidden().controlSize(.small)
+            .onChange(of: range) { _, range in
+                if !range.intervals.contains(interval) { interval = range.defaultInterval }
+            }
+            ChartIndicatorMenu(selection: $indicators).controlSize(.small)
+        }
+    }
+}
+
+/// Quote ticks update this small header independently of the chart and its controls.
+private struct QuoteMarketHeader: View {
+    @Environment(AppStore.self) private var store
+    @Binding var searching: Bool
+    @Binding var searchText: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            if !expanded {
-                HStack {
-                    TextField("Symbol", text: $symbol)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 140)
-                        .onSubmit { store.watchQuote(symbol: symbol) }
-                    Button("Watch") { store.watchQuote(symbol: symbol) }
-                        .keyboardShortcut(.defaultAction)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Button { searchText = ""; searching = true } label: {
+                    Label(store.quoteInstrument?.symbol ?? "Search instruments", systemImage: "magnifyingglass")
+                        .fontWeight(.semibold)
                 }
+                .buttonStyle(.bordered).controlSize(.large)
+                if let q = store.quote {
+                    Text(q.last.formatted())
+                        .font(.system(size: 28, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                    change(q)
+                    if q.delayed { Pill(text: "DELAYED", color: .orange) }
+                }
+                Spacer(minLength: 0)
             }
-
+            if let instrument = store.quoteInstrument {
+                Text("\(instrument.name) · \(instrument.primaryExchange) · \(instrument.currency)")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .help(instrument.name)
+            }
             if let q = store.quote {
-                if !expanded {
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text(q.symbol).font(.largeTitle.bold())
-                        Text(q.last.formatted()).font(.largeTitle).monospacedDigit()
-                        change(q)
-                        if q.delayed { Pill(text: "DELAYED", color: .orange) }
-                    }
-
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
-                        cell("Bid", q.bid.formatted(), q.bidSize).foregroundStyle(.red)
-                        cell("Ask", q.ask.formatted(), q.askSize).foregroundStyle(.green)
-                        cell("Close", q.close.formatted(), nil)
-                        cell("Volume", q.volume.map(\.quantity) ?? "—", nil)
-                    }
-                    .frame(maxWidth: 700)
-                    .monospacedDigit()
+                HStack(spacing: 20) {
+                    metric("Bid", value: q.bid.formatted(), tint: .red)
+                    metric("Ask", value: q.ask.formatted(), tint: .green)
+                    metric("Volume", value: q.volume.map(\.quantity) ?? "—", tint: .primary)
                 }
-
-                HStack(spacing: 16) {
-                    if expanded {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(q.symbol).font(.title2.bold())
-                            Text(q.last.formatted()).font(.title2).monospacedDigit()
-                            change(q)
-                        }
-                    }
-                    Picker("Range", selection: $range) {
-                        ForEach(ChartRange.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .frame(width: 200)
-                    Picker("Interval", selection: $interval) {
-                        ForEach(range.intervals, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .frame(width: 150)
-                    Spacer()
-                    Picker("Style", selection: $style) {
-                        Image(systemName: "chart.xyaxis.line").tag(PriceChart.Style.line)
-                        Image(systemName: "chart.bar.xaxis").tag(PriceChart.Style.candles)
-                    }
-                    .frame(width: 90)
-                    Button {
-                        withAnimation(.snappy) { expanded.toggle() }
-                    } label: {
-                        Image(systemName: expanded
-                              ? "arrow.down.right.and.arrow.up.left"
-                              : "arrow.up.left.and.arrow.down.right")
-                    }
-                    .help(expanded ? "Collapse chart (Esc)" : "Expand chart")
-                    .keyboardShortcut(expanded ? .cancelAction : nil)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: expanded ? .infinity : 700)
-                .onChange(of: range) { _, range in
-                    if !range.intervals.contains(interval) { interval = range.defaultInterval }
-                }
-
-                PriceChart(bars: store.history, series: store.historySeries, interval: interval, style: style,
-                           loading: store.loadingHistory, loadingOlder: store.loadingOlderHistory,
-                           needOlder: { Task { await store.loadOlderHistory() } })
-                    .frame(maxWidth: expanded ? .infinity : 700, minHeight: 240,
-                           maxHeight: expanded ? .infinity : 320)
-                    .task(id: "\(q.symbol)|\(range)|\(interval)") {
-                        // Skip the transient pair while a range change resets the interval.
-                        guard range.intervals.contains(interval) else { return }
-                        await store.loadHistory(symbol: q.symbol, range: range, interval: interval)
-                    }
             }
-            if !expanded { Spacer() }
         }
-        .padding()
-        .navigationTitle("Quote")
+        .monospacedDigit()
+        .card(tint: .blue)
+    }
+
+    private func metric(_ title: String, value: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title).foregroundStyle(.secondary)
+            Text(value).fontWeight(.medium).foregroundStyle(tint)
+        }.font(.callout)
     }
 
     @ViewBuilder
@@ -109,21 +127,36 @@ struct QuoteView: View {
         if let last = q.last, let close = q.close, close > 0 {
             let diff = last - close
             Text("\(diff >= 0 ? "+" : "")\(diff.formatted(.number.precision(.fractionLength(2)))) (\((diff / close).formatted(.percent.precision(.fractionLength(2)))))")
-                .font(.title3)
-                .monospacedDigit()
+                .font(.callout.weight(.medium))
                 .foregroundStyle(diff >= 0 ? .green : .red)
+                .lineLimit(1).minimumScaleFactor(0.8)
         }
     }
+}
 
-    private func cell(_ label: String, _ value: String, _ size: Double?) -> some View {
-        VStack(alignment: .leading) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline) {
-                Text(value).font(.title2.weight(.semibold))
-                if let size { Text("× \(size.quantity)").foregroundStyle(.secondary) }
+private struct QuoteHistoryChart: View {
+    @Environment(AppStore.self) private var store
+    let range: ChartRange
+    let interval: BarInterval
+    let style: PriceChart.Style
+    let indicators: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PriceChart(bars: store.history, series: store.historySeries, interval: interval, style: style,
+                       instrument: store.quoteInstrument, indicators: indicators,
+                       loading: store.loadingHistory, loadingOlder: store.loadingOlderHistory,
+                       needOlder: { Task { await store.loadOlderHistory() } })
+                .frame(maxWidth: .infinity, minHeight: 180, maxHeight: .infinity)
+            if let error = store.historyError {
+                Text(error).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .card()
+        .task(id: "\(store.quoteInstrument?.contractId ?? 0)|\(range)|\(interval)") {
+            guard range.intervals.contains(interval), let instrument = store.quoteInstrument else { return }
+            await store.loadHistory(instrument: instrument, range: range, interval: interval)
+        }
     }
 }
 
@@ -135,6 +168,7 @@ struct QuoteView: View {
 /// Input comes from `ChartInput`: drag or swipe sideways to pan; pinch, swipe vertically
 /// or use the wheel to zoom (Shift-wheel pans). After a click, ← → pan, + − zoom, 0 resets.
 struct PriceChart: View {
+    @Environment(AppStore.self) private var store
     enum Style: String {
         case line, candles
     }
@@ -144,6 +178,8 @@ struct PriceChart: View {
     let series: Int
     let interval: BarInterval
     let style: Style
+    let instrument: Instrument?
+    let indicators: Int
     let loading: Bool
     let loadingOlder: Bool
     /// Called when the user moves near the oldest loaded bar.
@@ -154,17 +190,32 @@ struct PriceChart: View {
     @State private var start: Double = 0
     /// The plot area within the chart, read from Charts for pointer anchoring.
     @State private var plot = CGRect.zero
+    @State private var levels: ChartSessionLevels?
+    @State private var levelsKey: String?
+    @State private var levelsError: String?
+    @State private var loadingLevels = false
+    @State private var indicatorNow = Date.now
 
     private static let minVisible: Double = 10
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if indicators != 0 { indicatorLegend }
+            pricePlot
+        }
+        .card()
+        .task(id: sessionRequestKey) { await loadLevels() }
+    }
+
+    private var pricePlot: some View {
         let slice = visibleSlice
-        let y = yDomain(slice)
+        let lines = indicatorLines
+        let y = yDomain(slice, levels: lines)
         let ticks = timeTicks()
-        Group {
+        return Group {
             switch style {
-            case .line: line(slice)
-            case .candles: candles(slice)
+            case .line: line(slice, levels: lines, floor: y.lowerBound)
+            case .candles: candles(slice, levels: lines)
             }
         }
         .chartXScale(domain: start - 0.5 ... start + max(visible, 1) - 0.5)
@@ -175,7 +226,18 @@ struct PriceChart: View {
         .chartOverlay { proxy in
             GeometryReader { geo in
                 let frame = proxy.plotFrame.map { geo[$0] } ?? geo.frame(in: .local)
-                Color.clear.onChange(of: frame, initial: true) { plot = frame }
+                ZStack(alignment: .topLeading) {
+                    Color.clear.onChange(of: frame, initial: true) { plot = frame }
+                    ForEach(levelLabels(lines, positions: lines.map { proxy.position(forY: $0.price) ?? 0 }, height: frame.height), id: \.level.id) { item in
+                        Text("\(item.level.id)  \(item.level.priceLabel)")
+                            .font(.system(size: 10, weight: .medium)).monospacedDigit()
+                            .foregroundStyle(item.level.color)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 3))
+                            .frame(width: 132, alignment: .trailing)
+                            .position(x: frame.maxX - 70, y: frame.minY + item.y)
+                    }
+                }.allowsHitTesting(false)
             }
         }
         // A plain overlay, not `chartOverlay`: Charts rebuilds that as the view changes,
@@ -205,40 +267,206 @@ struct PriceChart: View {
                 resetViewport()
             }
         }
-        .card()
     }
 
     // MARK: Marks
 
-    private func line(_ slice: ArraySlice<PriceBar>) -> some View {
+    private func line(_ slice: ArraySlice<PriceBar>, levels: [ChartLevel], floor: Double) -> some View {
         let up = (bars.last?.close ?? 0) >= (bars.first?.open ?? 0)
         let color: Color = up ? .green : .red
-        let floor = yDomain(slice).lowerBound
-        return Chart(slice.indices, id: \.self) { i in
-            AreaMark(x: .value("Bar", Double(i)), yStart: .value("Floor", floor), yEnd: .value("Close", bars[i].close))
-                .foregroundStyle(color.opacity(0.12))
-            LineMark(x: .value("Bar", Double(i)), y: .value("Close", bars[i].close))
-                .foregroundStyle(color)
-                .lineStyle(StrokeStyle(lineWidth: 1.5))
+        return Chart {
+            ForEach(slice.indices, id: \.self) { i in
+                AreaMark(x: .value("Bar", Double(i)), yStart: .value("Floor", floor), yEnd: .value("Close", bars[i].close))
+                    .foregroundStyle(color.opacity(0.12))
+                LineMark(x: .value("Bar", Double(i)), y: .value("Close", bars[i].close))
+                    .foregroundStyle(color)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+            }
+            indicatorMarks(levels)
         }
     }
 
-    private func candles(_ slice: ArraySlice<PriceBar>) -> some View {
-        Chart(slice.indices, id: \.self) { i in
-            let bar = bars[i]
-            let color: Color = bar.close >= bar.open ? .green : .red
-            let x = Double(i)
-            RuleMark(x: .value("Bar", x), yStart: .value("Low", bar.low), yEnd: .value("High", bar.high))
-                .lineStyle(StrokeStyle(lineWidth: 1))
+    private func candles(_ slice: ArraySlice<PriceBar>, levels: [ChartLevel]) -> some View {
+        Chart {
+            ForEach(slice.indices, id: \.self) { i in
+                let bar = bars[i]
+                let color: Color = bar.close >= bar.open ? .green : .red
+                let x = Double(i)
+                RuleMark(x: .value("Bar", x), yStart: .value("Low", bar.low), yEnd: .value("High", bar.high))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .foregroundStyle(color)
+                RectangleMark(
+                    xStart: .value("Start", x - 0.35),
+                    xEnd: .value("End", x + 0.35),
+                    yStart: .value("Open", bar.open),
+                    yEnd: .value("Close", bar.close)
+                )
                 .foregroundStyle(color)
-            RectangleMark(
-                xStart: .value("Start", x - 0.35),
-                xEnd: .value("End", x + 0.35),
-                yStart: .value("Open", bar.open),
-                yEnd: .value("Close", bar.close)
-            )
-            .foregroundStyle(color)
+            }
+            indicatorMarks(levels)
         }
+    }
+
+    @ChartContentBuilder
+    private func indicatorMarks(_ levels: [ChartLevel]) -> some ChartContent {
+        ForEach(levels) { level in
+            RuleMark(y: .value(level.id, level.price))
+                .foregroundStyle(level.color.opacity(0.8))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: level.low ? [3, 3] : [8, 3]))
+        }
+    }
+
+    // MARK: Indicators
+
+    private var selectedIndicators: [QuoteChartIndicator] {
+        QuoteChartIndicator.allCases.filter { $0.enabled(in: indicators) }
+    }
+
+    private var viewportIndices: Range<Int> {
+        ChartViewport.indices(count: bars.count, start: start, visible: visible)
+    }
+
+    private var sessionTime: Int64? {
+        guard let last = viewportIndices.last else { return nil }
+        return ChartSessionClock.sessionTime(lastVisible: bars[last].time,
+            atLatest: start + visible >= Double(bars.count) - 0.5, now: indicatorNow)
+    }
+
+    private var sessionRequestKey: String? {
+        guard selectedIndicators.contains(where: { $0 != .visible }),
+              let instrument, let sessionTime else { return nil }
+        return "\(instrument.contractId)|\(sessionTime)"
+    }
+
+    private var currentLevels: ChartSessionLevels? {
+        levelsKey == sessionRequestKey ? levels : nil
+    }
+
+    private var visibleRange: ChartPriceRange? {
+        var low = Double.infinity
+        var high = -Double.infinity
+        for i in viewportIndices {
+            let bar = bars[i]
+            guard bar.low.isFinite, bar.high.isFinite else { continue }
+            low = min(low, bar.low)
+            high = max(high, bar.high)
+        }
+        guard low.isFinite, high.isFinite else { return nil }
+        return ChartPriceRange(high: high, low: low)
+    }
+
+    private func indicatorRange(_ indicator: QuoteChartIndicator) -> ChartPriceRange? {
+        indicator == .visible ? visibleRange : indicator.range(in: currentLevels)
+    }
+
+    private var indicatorLines: [ChartLevel] {
+        selectedIndicators.flatMap { indicator in
+            indicatorRange(indicator).map { indicator.lines($0) } ?? []
+        }
+    }
+
+    private var indicatorLegend: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let sessionTime, sessionRequestKey != nil {
+                HStack(spacing: 6) {
+                    Text("Session levels · \(ChartSessionClock.label(sessionTime)) · New York")
+                        .help("Uses the session at the right edge of the chart. At the latest bar, uses today on weekdays, including premarket.")
+                    if loadingLevels { ProgressView().controlSize(.mini) }
+                }.font(.caption).foregroundStyle(.secondary)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), alignment: .leading)], alignment: .leading, spacing: 4) {
+                ForEach(selectedIndicators) { indicator in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(indicator.shortTitle).fontWeight(.medium).foregroundStyle(indicator.color)
+                        if let range = indicatorRange(indicator) {
+                            Text("H \(range.high.formatted(.number.precision(.fractionLength(2...4))))  L \(range.low.formatted(.number.precision(.fractionLength(2...4))))")
+                                .monospacedDigit()
+                            if indicator == .previousDay, let date = currentLevels?.previousSessionDate {
+                                Text(date).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Text(indicatorStatus(indicator)).foregroundStyle(.secondary)
+                        }
+                    }.font(.caption).frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            }
+            if let error = levelsError, sessionRequestKey != nil {
+                Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            }
+            if let levels = currentLevels {
+                if let error = levels.intradayError, selectedIndicators.contains(where: { $0 != .visible && $0 != .previousDay }) {
+                    Text("ORB / premarket: \(error)").font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                }
+                if let error = levels.previousDayError, QuoteChartIndicator.previousDay.enabled(in: indicators) {
+                    Text("Previous session: \(error)").font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                }
+                if QuoteChartIndicator.premarket.enabled(in: indicators),
+                   ChartSessionClock.calendar.component(.hour, from: indicatorNow) < 10,
+                   sessionTime == ChartSessionClock.startOfDay(indicatorNow) {
+                    Text("Premarket develops until 9:30. ORB appears after 9:45 / 10:00. Refreshes every minute.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func indicatorStatus(_ indicator: QuoteChartIndicator) -> String {
+        if indicator == .visible { return "No bars in view" }
+        if loadingLevels || levelsKey != sessionRequestKey { return "Loading…" }
+        guard let levels = currentLevels else { return "Unavailable" }
+        if indicator == .orb15 || indicator == .orb30,
+           let sessionTime {
+            let end = sessionTime + Int64((indicator == .orb15 ? 9 * 60 + 45 : 10 * 60) * 60)
+            if levels.asOf < end { return indicator == .orb15 ? "Waiting for 9:45 AM NY" : "Waiting for 10:00 AM NY" }
+        }
+        return "No data for this session"
+    }
+
+    private func loadLevels() async {
+        levels = nil
+        levelsError = nil
+        levelsKey = nil
+        loadingLevels = false
+        guard let key = sessionRequestKey, let instrument, let sessionTime else { return }
+        // Panning can cross many dates; only request once the view settles.
+        do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+        while !Task.isCancelled {
+            loadingLevels = true
+            do {
+                let loaded = try await store.chartSessionLevels(instrument: instrument, sessionTime: sessionTime)
+                guard !Task.isCancelled else { return }
+                levels = loaded
+                levelsKey = key
+                levelsError = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                levelsKey = key
+                levelsError = (error as? ActionError)?.message ?? error.localizedDescription
+            }
+            loadingLevels = false
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            indicatorNow = .now
+        }
+    }
+
+    /// Keep nearby labels legible, including when multiple indicators share a price.
+    private func levelLabels(_ levels: [ChartLevel], positions: [CGFloat], height: CGFloat) -> [(level: ChartLevel, y: CGFloat)] {
+        guard height > 0 else { return [] }
+        let gap = min(16.0, max(0, (height - 16) / CGFloat(max(levels.count - 1, 1))))
+        var placed: [(level: ChartLevel, y: CGFloat)] = zip(levels, positions).map { level, position in
+            (level: level, y: position)
+        }
+        placed.sort { a, b in
+            if a.y == b.y { return a.level.id < b.level.id }
+            return a.y < b.y
+        }
+        for i in placed.indices {
+            placed[i].y = max(placed[i].y, i == 0 ? 8 : placed[i - 1].y + gap)
+        }
+        for i in placed.indices.reversed() {
+            placed[i].y = min(placed[i].y, i == placed.count - 1 ? height - 8 : placed[i + 1].y - gap)
+        }
+        return placed
     }
 
     // MARK: Viewport
@@ -252,10 +480,20 @@ struct PriceChart: View {
     }
 
     /// Fits the prices in view, with a little headroom.
-    private func yDomain(_ slice: ArraySlice<PriceBar>) -> ClosedRange<Double> {
-        let lows = style == .line ? slice.map(\.close) : slice.map(\.low)
-        let highs = style == .line ? slice.map(\.close) : slice.map(\.high)
-        guard let lo = lows.min(), let hi = highs.max() else { return 0...1 }
+    private func yDomain(_ slice: ArraySlice<PriceBar>, levels: [ChartLevel]) -> ClosedRange<Double> {
+        var lo = Double.infinity
+        var hi = -Double.infinity
+        for bar in slice {
+            let low = style == .line ? bar.close : bar.low
+            let high = style == .line ? bar.close : bar.high
+            if low.isFinite { lo = min(lo, low) }
+            if high.isFinite { hi = max(hi, high) }
+        }
+        for level in levels where level.price.isFinite {
+            lo = min(lo, level.price)
+            hi = max(hi, level.price)
+        }
+        guard lo.isFinite, hi.isFinite, lo <= hi else { return 0...1 }
         let pad = max((hi - lo) * 0.05, hi * 0.0005)
         return (lo - pad)...(hi + pad)
     }

@@ -32,7 +32,24 @@ struct PnLTallyView: View {
     private var tally: PnlTally? { store.ledger?.tallies.first { $0.period == period } }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 16) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 20) {
+                summary
+                periodPicker
+            }.fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: 12) {
+                summary
+                periodPicker
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .monospacedDigit()
+        .padding(16)
+        .background(AppTheme.accent.opacity(0.04))
+    }
+
+    private var summary: some View {
+        HStack(alignment: .center, spacing: 20) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Realized P/L · net of fees").font(.caption).foregroundStyle(.secondary)
                 if let tally {
@@ -58,20 +75,18 @@ struct PnLTallyView: View {
                 .help("IB's realized P&L on closing fills, which already subtracts the commissions on both the opening and closing legs. Commissions & fees counts every fill in the period, including positions still open.")
             }
 
-            Spacer(minLength: 8)
-
-            Picker("Period", selection: $periodRaw) {
-                ForEach([PnlPeriod.day, .week, .month, .year], id: \.self) { p in
-                    Text(p.title).tag(p.title.lowercased())
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
         }
-        .monospacedDigit()
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+    }
+
+    private var periodPicker: some View {
+        Picker("Period", selection: $periodRaw) {
+            ForEach([PnlPeriod.day, .week, .month, .year], id: \.self) { p in
+                Text(p.title).tag(p.title.lowercased())
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
     }
 
     private func tradesLine(_ t: PnlTally) -> String {

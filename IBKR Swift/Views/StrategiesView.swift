@@ -16,12 +16,13 @@ struct StrategiesView: View {
             List {
                 ForEach(store.strategies, id: \.id) { u in
                     StrategyRow(update: u, spec: store.strategySpecs[u.id])
+                        .padding(.vertical, 8)
                 }
             }
             .overlay {
                 if store.strategies.isEmpty {
-                    ContentUnavailableView("No Strategies", systemImage: "scope",
-                                           description: Text("Armed and recent strategies appear here."))
+                    WorkspaceEmptyState(title: "No strategies yet", icon: "scope",
+                                        description: "Armed and recent strategies appear here.", tint: .purple)
                 }
             }
         }

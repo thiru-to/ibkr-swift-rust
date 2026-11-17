@@ -14,12 +14,18 @@ struct ConnectionBar: ToolbarContent {
         @Bindable var store = store
         ToolbarItemGroup(placement: .primaryAction) {
             if store.connection == .connected {
-                Circle()
-                    .fill(store.linkProblem == nil ? Color.green : Color.orange)
-                    .frame(width: 8, height: 8)
-                    .help(store.linkProblem ?? "Connected to IB Gateway")
-                ModeBadge(isLive: store.isLive)
-                Text(store.account).monospaced().foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(store.linkProblem == nil ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                        .help(store.linkProblem ?? "Connected to IB Gateway")
+                    ModeBadge(isLive: store.isLive)
+                    Text(store.account)
+                        .monospaced()
+                        .foregroundStyle(.secondary)
+                }
+                .fixedSize()
+                .padding(.horizontal, 10)
                 if store.risk?.halted != nil {
                     Pill(text: "HALTED", color: .red, solid: true)
                         .help(store.risk?.halted ?? "")
@@ -43,9 +49,15 @@ struct ConnectionBar: ToolbarContent {
                 ModeBadge(isLive: store.mode == .live)
                     .help("Change in the Account menu")
                 TextField("Host", text: $store.host).frame(width: 110)
+                    .help("IB Gateway host").accessibilityLabel("Gateway host")
+                    .disabled(store.connection == .connecting)
                 TextField("Port", value: $store.port, format: .number.grouping(.never)).frame(width: 60)
+                    .help("IB Gateway port").accessibilityLabel("Gateway port")
+                    .disabled(store.connection == .connecting)
                 TextField("Client ID", value: $store.clientId, format: .number.grouping(.never)).frame(width: 50)
                     .help("Client ID (must be unique per API connection)")
+                    .accessibilityLabel("Client ID")
+                    .disabled(store.connection == .connecting)
                 Button("Connect", systemImage: "bolt") {
                     Task { await store.connect() }
                 }

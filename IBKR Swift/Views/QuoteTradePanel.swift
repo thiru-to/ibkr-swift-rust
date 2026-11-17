@@ -123,8 +123,8 @@ struct QuoteTradePanel: View {
     private func prepare(side: OrderSide, kind: OrderKind, closing: Bool) {
         guard !blocked, let i = store.quoteInstrument else { return }
         let request = InstrumentOrderRequest(instrument: i, side: side, quantity: closing ? abs(held) : Double(shares), kind: kind, tif: closing || kind == .market ? .day : tif)
-        let action = QuoteTradeReview(request: request, closing: closing, held: held, account: store.account, live: store.isLive)
-        if store.isLive { review = action } else { send(action) }
+        // Every submit is reviewed first, on paper too (as on the Orders screen).
+        review = QuoteTradeReview(request: request, closing: closing, held: held, account: store.account, live: store.isLive)
     }
     private func send(_ action: QuoteTradeReview) {
         Task { await store.submitQuoteTrade(action.request, closeQuantity: action.held, closing: action.closing, reviewedAccount: action.account, reviewedLive: action.live) }

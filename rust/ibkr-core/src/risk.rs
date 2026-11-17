@@ -162,6 +162,7 @@ struct State {
 pub(crate) struct RiskGuard {
     client: Arc<Client>,
     client_id: i32,
+    account: String,
     owned: OwnedOrders,
     /// Entries need the guard running (live port or a non-paper account).
     live: bool,
@@ -171,9 +172,9 @@ pub(crate) struct RiskGuard {
 }
 
 impl RiskGuard {
-    pub(crate) fn new(client: Arc<Client>, client_id: i32, owned: OwnedOrders, live: bool) -> Arc<Self> {
+    pub(crate) fn new(client: Arc<Client>, client_id: i32, account: String, owned: OwnedOrders, live: bool) -> Arc<Self> {
         let state = State { book: RiskBook::new(&trading_day()), path: None, listener: None, pnl: None, running: false };
-        Arc::new(RiskGuard { client, client_id, owned, live, state: Mutex::new(state), halt_tx: watch::channel(None).0 })
+        Arc::new(RiskGuard { client, client_id, account, owned, live, state: Mutex::new(state), halt_tx: watch::channel(None).0 })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -229,7 +230,7 @@ impl RiskGuard {
         }
         self.halt_tx.send_replace(s.book.halted.clone());
         if halted_now {
-            rt().spawn(cancel_manual_buys(self.client.clone(), self.client_id, self.owned.clone()));
+            rt().spawn(cancel_manual_buys(self.client.clone(), self.client_id, self.account.clone(), self.owned.clone()));
         }
     }
 
@@ -325,19 +326,53 @@ fn save(path: &Path, book: &RiskBook) -> std::io::Result<()> {
 
 /// This client's working buy orders that no strategy owns (strategies cancel their own
 /// entries). Orders from TWS or other clients can't be cancelled by this connection.
-async fn cancel_manual_buys(client: Arc<Client>, client_id: i32, owned: OwnedOrders) {
+/// Cancels this client's working buys that could open or add to a position. Buys that
+/// only cover a short (a buy-to-close, or a stop / take-profit on a short) are exits and
+/// stay working. If positions can't be read, every manual buy is cancelled.
+async fn cancel_manual_buys(client: Arc<Client>, client_id: i32, account: String, owned: OwnedOrders) {
     let Ok(working) = position::working_orders(&client, None).await else { return };
+    let held = position::all_positions(&client, &account).await.unwrap_or_default();
     let owned: Vec<i32> = owned.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
-    for d in working {
-        if d.order.client_id == client_id && d.order.action == Action::Buy && !owned.contains(&d.order_id) {
-            let _ = client.cancel_order(d.order_id, "").await;
+    let buys: Vec<(i32, i32, f64)> = working
+        .iter()
+        .filter(|d| d.order.client_id == client_id && d.order.action == Action::Buy && !owned.contains(&d.order_id))
+        .filter(|d| d.order.account == account || d.order.account.is_empty())
+        .map(|d| (d.order_id, d.contract.contract_id, (d.order.total_quantity - d.order.filled_quantity).max(0.0)))
+        .collect();
+    for id in buys_to_cancel(&buys, &held) {
+        let _ = client.cancel_order(id, "").await;
+    }
+}
+
+/// `buys` is (order id, contract id, remaining quantity). Per contract, buys are kept while
+/// together they fit inside the short position; any buy beyond that is cancelled.
+pub(crate) fn buys_to_cancel(buys: &[(i32, i32, f64)], held: &std::collections::HashMap<i32, f64>) -> Vec<i32> {
+    let mut cover: std::collections::HashMap<i32, f64> = held.iter().map(|(c, q)| (*c, (-q).max(0.0))).collect();
+    let mut out = Vec::new();
+    for &(id, contract, remaining) in buys {
+        let room = cover.entry(contract).or_insert(0.0);
+        if remaining > 0.0 && remaining <= *room + 1e-9 {
+            *room -= remaining;
+        } else {
+            out.push(id);
         }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn halt_keeps_buys_that_only_cover_shorts() {
+        let held = std::collections::HashMap::from([(1, -100.0), (2, 50.0)]);
+        // Contract 1 is short 100: a 60 stop + 40 take-profit cover it; a further 10 would open.
+        // Contract 2 is long, contract 3 flat: any buy adds risk.
+        let buys = [(10, 1, 60.0), (11, 1, 40.0), (12, 1, 10.0), (13, 2, 5.0), (14, 3, 1.0)];
+        assert_eq!(buys_to_cancel(&buys, &held), vec![12, 13, 14]);
+        assert_eq!(buys_to_cancel(&[(15, 1, 150.0)], &held), vec![15], "flips the short to long");
+    }
 
     fn limits(loss: Option<f64>, cost: Option<f64>) -> RiskLimits {
         RiskLimits { max_daily_loss: loss, max_cost_per_trade: cost }

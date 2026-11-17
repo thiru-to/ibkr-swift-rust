@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use futures::stream::{SelectAll, Stream, StreamExt};
 use ibapi::Client;
 use ibapi::contracts::tick_types::TickType;
@@ -778,7 +779,7 @@ async fn protect_and_monitor(
     }
 
     let mut eod_fallback: Option<jiff::Timestamp> = None;
-    let mut placed = 0;
+    let mut placed: usize = 0;
     for (kind, order) in orders {
         match place_exit(client, opt, kind, order, &oca, tif.clone(), t).await {
             Ok((_, stream)) => {
@@ -820,67 +821,152 @@ async fn protect_and_monitor(
     tokio::pin!(eod_sleep);
 
     let mut cmds_open = true;
-    let mut closing = false;
-    let mut cancelled: Vec<i32> = Vec::new();
-    let mut fills = ExitFills::default();
+    // The EOD sleep completes once; it must never be polled again after that.
+    let mut eod_fired = false;
+    let mut m = Monitor {
+        quantity,
+        fill,
+        multiplier: opt.multiplier,
+        placed,
+        close_order: None,
+        resume_state: t.u.state,
+        cancelled: Vec::new(),
+        fills: ExitFills::default(),
+    };
     loop {
-        tokio::select! {
+        let closing = m.close_order.is_some();
+        let close_kind = tokio::select! {
             cmd = cmds.recv(), if cmds_open => match cmd {
-                Some(Cmd::CloseNow) if !closing => {
-                    closing = true;
-                    placed += 1;
-                    close_now(client, opt, quantity - fills.filled(), &oca, tif.clone(), Exit::CloseNow, &mut exits, t).await;
+                Some(Cmd::CloseNow) if !closing => Some(Exit::CloseNow),
+                Some(_) => None,
+                None => {
+                    cmds_open = false;
+                    None
                 }
-                Some(_) => {}
-                None => cmds_open = false,
             },
-            _ = &mut eod_sleep, if has_eod_fallback && !closing => {
-                closing = true;
-                placed += 1;
-                close_now(client, opt, quantity - fills.filled(), &oca, tif.clone(), Exit::EodClose, &mut exits, t).await;
+            _ = &mut eod_sleep, if has_eod_fallback && !eod_fired && !closing => {
+                eod_fired = true;
+                Some(Exit::EodClose)
             }
             item = exits.next(), if !exits.is_empty() => {
-                let Some((kind, order_id, item)) = item else { continue };
-                match item {
-                    Ok(s) => {
-                        let sold_before = fills.filled();
-                        if s.filled > 0.0 {
-                            fills.update(order_id, s.filled, s.average_fill_price);
-                        }
-                        let sold = fills.filled();
-                        if sold >= quantity - 1e-9 {
-                            t.u.exit_price = fills.average();
-                            t.u.realized_pnl = t.u.exit_price.map(|exit| ((exit - fill) * quantity * opt.multiplier * 100.0).round() / 100.0);
-                            t.u.can_close = false;
-                            let at = t.u.exit_price.map_or("unknown price".into(), |p| p.to_string());
-                            return t.set(StrategyState::Closed, format!("Closed by {kind} @ {at}"));
-                        }
-                        if sold > sold_before {
-                            t.set(t.u.state, format!("{kind} sold {sold} of {quantity}; the other exits were reduced to the remaining {}", quantity - sold));
-                        }
-                        // OCA siblings are cancelled when the position is sold, and those
-                        // cancels can arrive before the fill. Only alarm once every exit
-                        // is gone without the whole position sold.
-                        if matches!(s.status, OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive)
-                            && !cancelled.contains(&order_id)
-                        {
-                            cancelled.push(order_id);
-                            if cancelled.len() == placed && !closing {
-                                t.set(StrategyState::Unprotected, format!("All exit orders were cancelled; {} still open", quantity - sold));
-                            }
-                        }
-                    }
-                    Err(e) => t.set(t.u.state, format!("Lost tracking of the {kind} order (it stays at IB): {e}")),
+                if let Some((kind, order_id, item)) = item
+                    && m.on_status(t, kind, order_id, item)
+                {
+                    return;
                 }
+                None
             }
             else => {
                 // No exits left to watch and no commands possible.
                 return;
             }
+        };
+        let Some(kind) = close_kind else { continue };
+
+        // Size the close from every exit fill that has already reached the app, not just
+        // the ones handled so far: a take-profit fill still queued here would otherwise
+        // make the close sell more than is left. IB doesn't shrink a member that joins
+        // the OCA group after a fill.
+        while let Some(Some((k, order_id, item))) = exits.next().now_or_never() {
+            if m.on_status(t, k, order_id, item) {
+                return;
+            }
+        }
+        if !t.u.can_close {
+            continue; // the drain found the strategy can no longer close
+        }
+        let before = t.u.state;
+        match close_now(client, opt, quantity - m.fills.filled(), &oca, tif.clone(), kind, &mut exits, t).await {
+            Ok(id) => {
+                m.close_order = Some(id);
+                m.resume_state = before;
+                m.placed += 1;
+            }
+            Err(e) => close_failed(t, kind, &e, m.working()),
         }
     }
 }
 
+/// What the exit monitor tracks across the strategy's exit orders.
+struct Monitor {
+    quantity: f64,
+    fill: f64,
+    multiplier: f64,
+    /// Exit orders whose statuses are being read.
+    placed: usize,
+    /// The working close-now / app-side EOD market sell, if any. While it's working, repeat
+    /// presses are ignored. If it fails or ends unfilled, this clears so Close Now works again.
+    close_order: Option<i32>,
+    /// The state to go back to if the close ends without selling everything.
+    resume_state: StrategyState,
+    cancelled: Vec<i32>,
+    fills: ExitFills,
+}
+
+impl Monitor {
+    fn working(&self) -> usize {
+        self.placed.saturating_sub(self.cancelled.len())
+    }
+
+    /// Applies one exit order's status; true once the strategy is finished (Closed).
+    fn on_status(&mut self, t: &mut Tracker, kind: Exit, order_id: i32, item: Result<OrderStatus, ibapi::Error>) -> bool {
+        let quantity = self.quantity;
+        let s = match item {
+            Ok(s) => s,
+            Err(e) => {
+                t.set(t.u.state, format!("Lost tracking of the {kind} order (it stays at IB): {e}"));
+                return false;
+            }
+        };
+        let sold_before = self.fills.filled();
+        if s.filled > 0.0 {
+            self.fills.update(order_id, s.filled, s.average_fill_price);
+        }
+        let sold = self.fills.filled();
+        if sold >= quantity - 1e-9 {
+            t.u.exit_price = self.fills.average();
+            t.u.realized_pnl = t.u.exit_price.map(|exit| ((exit - self.fill) * quantity * self.multiplier * 100.0).round() / 100.0);
+            t.u.can_close = false;
+            let at = t.u.exit_price.map_or("unknown price".into(), |p| p.to_string());
+            t.set(StrategyState::Closed, format!("Closed by {kind} @ {at}"));
+            return true;
+        }
+        if sold > sold_before {
+            t.set(t.u.state, format!("{kind} sold {sold} of {quantity}; the other exits were reduced to the remaining {}", quantity - sold));
+        }
+        // OCA siblings are cancelled when the position is sold, and those cancels can
+        // arrive before the fill. Only alarm once every exit is gone without the whole
+        // position sold.
+        if matches!(s.status, OrderStatusKind::Cancelled | OrderStatusKind::ApiCancelled | OrderStatusKind::Inactive)
+            && !self.cancelled.contains(&order_id)
+        {
+            self.cancelled.push(order_id);
+            let working = self.working();
+            if self.close_order == Some(order_id) {
+                // The market close ended without selling everything (rejected, cancelled
+                // in TWS, …). Don't strand the strategy in Closing: report it and let
+                // Close Now be pressed again.
+                self.close_order = None;
+                t.u.can_close = true;
+                let state = match self.resume_state {
+                    StrategyState::Protected if working == 0 => StrategyState::Unprotected,
+                    s => s,
+                };
+                let why = if s.why_held.is_empty() { String::new() } else { format!(" ({})", s.why_held) };
+                t.set(state, format!(
+                    "{kind} order #{order_id} ended {:?}{why} with {} of {quantity} still open. Close Now can be tried again.",
+                    s.status,
+                    quantity - sold
+                ));
+            } else if working == 0 && self.close_order.is_none() {
+                t.set(StrategyState::Unprotected, format!("All exit orders were cancelled; {} still open", quantity - sold));
+            }
+        }
+        false
+    }
+}
+
+/// Market-sells `quantity` inside the OCA group; returns the order id once IB has it.
 #[allow(clippy::too_many_arguments)]
 async fn close_now(
     client: &Client,
@@ -891,16 +977,24 @@ async fn close_now(
     kind: Exit,
     exits: &mut SelectAll<ExitStream>,
     t: &mut Tracker,
-) {
+) -> Result<i32, String> {
     let order = order_builder::market_order(Action::Sell, quantity);
-    match place_exit(client, opt, kind, order, oca, tif, t).await {
-        Ok((order_id, stream)) => {
-            exits.push(stream);
-            t.u.can_close = false;
-            t.set(StrategyState::Closing, format!("{kind}: selling {quantity} at market (order #{order_id})"));
-        }
-        Err(e) => t.set(StrategyState::Unprotected, format!("{kind} failed: {e}")),
-    }
+    let (order_id, stream) = place_exit(client, opt, kind, order, oca, tif, t).await?;
+    exits.push(stream);
+    t.u.can_close = false;
+    t.set(StrategyState::Closing, format!("{kind}: selling {quantity} at market (order #{order_id})"));
+    Ok(order_id)
+}
+
+/// A close that IB refused leaves the position and its other exits as they were, so the
+/// state only turns Unprotected when no exit is working. Close Now stays available.
+fn close_failed(t: &mut Tracker, kind: Exit, e: &str, working_exits: usize) {
+    t.u.can_close = true;
+    let state = match t.u.state {
+        StrategyState::Protected if working_exits == 0 => StrategyState::Unprotected,
+        s => s,
+    };
+    t.set(state, format!("{kind} failed: {e}. The position is still open; Close Now can be tried again."));
 }
 
 #[cfg(test)]
@@ -928,6 +1022,102 @@ mod tests {
 
     fn at(hh: i8, mm: i8) -> Zoned {
         jiff::civil::date(2026, 10, 22).at(hh, mm, 0, 0).to_zoned(eastern()).unwrap()
+    }
+
+    struct NoListener;
+    impl StrategyListener for NoListener {
+        fn on_update(&self, _: StrategyUpdate) {}
+    }
+
+    fn tracker(state: StrategyState) -> Tracker {
+        Tracker {
+            u: StrategyUpdate {
+                id: 1,
+                state,
+                message: String::new(),
+                option_local_symbol: String::new(),
+                contract_id: 0,
+                underlying_last: None,
+                underlying_delayed: false,
+                entry_order_id: Some(1),
+                exit_order_ids: vec![2, 3],
+                filled_quantity: 2.0,
+                average_fill: Some(1.0),
+                take_profit_price: None,
+                stop_price: None,
+                stop_limit_price: None,
+                eod_close_at: None,
+                exit_price: None,
+                realized_pnl: None,
+                can_close: true,
+                requires_app: false,
+                entry_timing: None,
+            },
+            listener: Arc::new(NoListener),
+            eod_by_app: false,
+            owned: OwnedOrders::default(),
+        }
+    }
+
+    /// Take-profit #2 and stop #3 are working; close-now #4 has been sent.
+    fn closing_monitor() -> Monitor {
+        Monitor {
+            quantity: 2.0,
+            fill: 1.0,
+            multiplier: 100.0,
+            placed: 3,
+            close_order: Some(4),
+            resume_state: StrategyState::Protected,
+            cancelled: Vec::new(),
+            fills: ExitFills::default(),
+        }
+    }
+
+    fn status(order_id: i32, status: OrderStatusKind, filled: f64, avg: Option<f64>) -> Result<OrderStatus, ibapi::Error> {
+        Ok(OrderStatus { order_id, status, filled, average_fill_price: avg, ..Default::default() })
+    }
+
+    #[test]
+    fn a_cancelled_close_now_can_be_retried() {
+        let mut t = tracker(StrategyState::Closing);
+        t.u.can_close = false;
+        let mut m = closing_monitor();
+        assert!(!m.on_status(&mut t, Exit::CloseNow, 4, status(4, OrderStatusKind::Cancelled, 0.0, None)));
+        assert_eq!(m.close_order, None);
+        assert!(t.u.can_close, "Close Now must work again");
+        assert_eq!(t.u.state, StrategyState::Protected, "the take-profit and stop still work");
+    }
+
+    #[test]
+    fn a_cancelled_close_now_with_no_exits_left_is_unprotected() {
+        let mut t = tracker(StrategyState::Closing);
+        let mut m = closing_monitor();
+        m.cancelled = vec![2, 3];
+        m.on_status(&mut t, Exit::CloseNow, 4, status(4, OrderStatusKind::Inactive, 0.0, None));
+        assert_eq!(t.u.state, StrategyState::Unprotected);
+        assert!(t.u.can_close);
+    }
+
+    #[test]
+    fn close_now_fills_after_its_siblings_are_cancelled() {
+        let mut t = tracker(StrategyState::Closing);
+        let mut m = closing_monitor();
+        // IB cancels the reduced siblings, possibly before the close's fill arrives.
+        m.on_status(&mut t, Exit::TakeProfit, 2, status(2, OrderStatusKind::Cancelled, 0.0, None));
+        m.on_status(&mut t, Exit::Stop, 3, status(3, OrderStatusKind::Cancelled, 0.0, None));
+        assert_eq!(t.u.state, StrategyState::Closing, "not an alarm while the close is working");
+        assert!(m.on_status(&mut t, Exit::CloseNow, 4, status(4, OrderStatusKind::Filled, 2.0, Some(1.25))));
+        assert_eq!(t.u.state, StrategyState::Closed);
+        assert_eq!(t.u.realized_pnl, Some(50.0));
+    }
+
+    #[test]
+    fn close_failure_keeps_working_exits_protected() {
+        let mut t = tracker(StrategyState::Protected);
+        close_failed(&mut t, Exit::CloseNow, "rejected", 2);
+        assert_eq!((t.u.state, t.u.can_close), (StrategyState::Protected, true));
+        close_failed(&mut t, Exit::CloseNow, "rejected", 0);
+        assert_eq!(t.u.state, StrategyState::Unprotected);
     }
 
     #[test]

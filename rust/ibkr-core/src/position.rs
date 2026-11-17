@@ -78,6 +78,26 @@ pub(crate) async fn current_position(client: &Client, account: &str, contract_id
     position_where(client, account, |c| c.contract_id == contract_id).await
 }
 
+/// Every position the account holds, by contract id, straight from IB.
+pub(crate) async fn all_positions(client: &Client, account: &str) -> Result<HashMap<i32, f64>, IbkrError> {
+    let mut sub = client.positions().await?.filter_data();
+    let mut held = HashMap::new();
+    let read = async {
+        while let Some(item) = sub.next().await {
+            match item? {
+                PositionUpdate::Position(p) if p.account == account => {
+                    held.insert(p.contract.contract_id, p.position);
+                }
+                PositionUpdate::Position(_) => {}
+                PositionUpdate::PositionEnd => return Ok(()),
+            }
+        }
+        Err(api("the positions stream ended"))
+    };
+    tokio::time::timeout(WAIT, read).await.map_err(|_| api("IB didn't report positions in time"))??;
+    Ok(held)
+}
+
 async fn position_where(client: &Client, account: &str, matches: impl Fn(&Contract) -> bool) -> Result<f64, IbkrError> {
     let mut sub = client.positions().await?.filter_data();
     let mut quantity = 0.0;

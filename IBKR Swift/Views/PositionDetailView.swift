@@ -284,8 +284,18 @@ private struct ClosePanel: View {
     private var quote: Quote? { store.positionQuote }
     private var long: Bool { position.quantity > 0 }
 
-    /// The price closing trades against: the bid when selling, the ask when buying.
-    private var reference: Double? { (long ? quote?.bid : quote?.ask) ?? quote?.last }
+    /// The price closing trades against: the bid when selling, the ask when buying, else
+    /// the last trade (a worthless option can show a 0 bid).
+    private var reference: Double? {
+        let side = long ? quote?.bid : quote?.ask
+        if let side, side > 0 { return side }
+        return quote?.last.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    private var referenceName: String {
+        let side = long ? quote?.bid : quote?.ask
+        return (side ?? 0) > 0 ? (long ? "bid" : "ask") : "last"
+    }
 
     private var limitPrice: Double? {
         guard let reference, reference > 0, let cap = capPercent, cap >= 0 else { return nil }
@@ -314,7 +324,7 @@ private struct ClosePanel: View {
                     Text("% \(long ? "below the bid" : "above the ask")").foregroundStyle(.secondary)
                 }
                 if let limitPrice, let reference {
-                    Text("Limit ≈ \(Optional(limitPrice).formatted(digits: 2)) (\(long ? "bid" : "ask") \(reference.formatted())), rounded to a valid tick. Day order.")
+                    Text("Limit ≈ \(Optional(limitPrice).formatted(digits: 2)) (\(referenceName) \(reference.formatted())), rounded to a valid tick. Day order.")
                         .font(.callout)
                     Text("Est. \(long ? "proceeds" : "cost") at worst \(Optional(limitPrice * abs(position.quantity) * position.multiplier).money(position.currency))")
                         .font(.callout).foregroundStyle(.secondary)

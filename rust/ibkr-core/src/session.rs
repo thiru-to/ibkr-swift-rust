@@ -156,7 +156,7 @@ pub async fn connect(host: String, port: u16, client_id: i32) -> Result<Arc<Ibkr
         let client = Arc::new(client);
         let strategy_orders = OwnedOrders::default();
         let live = LIVE_PORTS.contains(&port) || !account.starts_with('D');
-        let risk = RiskGuard::new(client.clone(), client_id, strategy_orders.clone(), live);
+        let risk = RiskGuard::new(client.clone(), client_id, account.clone(), strategy_orders.clone(), live);
         Ok(Arc::new(IbkrSession { client, account, port, client_id, strategy_orders, risk, latency: Default::default(), search: Default::default(), order_gate: Default::default() }))
     })
     .await
@@ -508,7 +508,9 @@ impl IbkrSession {
             }
             let held = position::current_position(&client, &account, contract.contract_id).await?;
             let working: Vec<_> = position::working_orders(&client, Some(contract.contract_id)).await?.into_iter().filter(|d| d.order.account == account || d.order.account.is_empty()).collect();
-            let opening = opening_quantity(held, request.side, request.quantity, !working.is_empty());
+            let side = match request.side { OrderSide::Buy => ibapi::orders::Action::Buy, OrderSide::Sell => ibapi::orders::Action::Sell };
+            let pending: f64 = working.iter().filter(|d| d.order.action == side).map(|d| (d.order.total_quantity - d.order.filled_quantity).max(0.0)).sum();
+            let opening = opening_quantity(held, request.side, request.quantity, pending);
             if opening > 0.0 {
                 let price = match request.kind {
                     OrderKind::Limit { price } => Some(price),
@@ -613,10 +615,13 @@ fn validate_instrument_order(request: &InstrumentOrderRequest) -> Result<(), Ibk
     Ok(())
 }
 
-/// Pending orders make the amount available to reduce uncertain.
-fn opening_quantity(held: f64, side: OrderSide, quantity: f64, pending: bool) -> f64 {
-    if pending { return quantity; }
-    let reducible = match side { OrderSide::Buy => (-held).max(0.0), OrderSide::Sell => held.max(0.0) };
+/// The part of an order that opens or adds to a position (what the risk guard checks).
+/// `pending_same_side` is what working orders on the same side could still fill: if they
+/// all fill first, only what's left of the position can be reduced. Reducing orders are
+/// exits and are never gated.
+fn opening_quantity(held: f64, side: OrderSide, quantity: f64, pending_same_side: f64) -> f64 {
+    let pending = pending_same_side.max(0.0);
+    let reducible = match side { OrderSide::Buy => (-held - pending).max(0.0), OrderSide::Sell => (held - pending).max(0.0) };
     (quantity - reducible).max(0.0)
 }
 
@@ -978,16 +983,20 @@ mod tests {
     #[test]
     fn entries_reductions_and_reversals_include_short_risk() {
         for (held, side, qty, pending, expected) in [
-            (0.0, OrderSide::Buy, 25.0, false, 25.0),
-            (0.0, OrderSide::Sell, 100.0, false, 100.0),
-            (100.0, OrderSide::Sell, 25.0, false, 0.0),
-            (-100.0, OrderSide::Buy, 25.0, false, 0.0),
-            (100.0, OrderSide::Sell, 250.0, false, 150.0),
-            (-100.0, OrderSide::Buy, 250.0, false, 150.0),
-            (100.0, OrderSide::Buy, 25.0, false, 25.0),
-            (-100.0, OrderSide::Sell, 25.0, false, 25.0),
-            (100.0, OrderSide::Sell, 25.0, true, 25.0),
-            (-100.0, OrderSide::Buy, 25.0, true, 25.0),
+            (0.0, OrderSide::Buy, 25.0, 0.0, 25.0),
+            (0.0, OrderSide::Sell, 100.0, 0.0, 100.0),
+            (100.0, OrderSide::Sell, 25.0, 0.0, 0.0),
+            (-100.0, OrderSide::Buy, 25.0, 0.0, 0.0),
+            (100.0, OrderSide::Sell, 250.0, 0.0, 150.0),
+            (-100.0, OrderSide::Buy, 250.0, 0.0, 150.0),
+            (100.0, OrderSide::Buy, 25.0, 0.0, 25.0),
+            (-100.0, OrderSide::Sell, 25.0, 0.0, 25.0),
+            // A working sell stop for the whole long: another sell could open a short.
+            (100.0, OrderSide::Sell, 25.0, 100.0, 25.0),
+            (-100.0, OrderSide::Buy, 25.0, 100.0, 25.0),
+            // Part of the position isn't spoken for: selling that much is an exit.
+            (100.0, OrderSide::Sell, 25.0, 50.0, 0.0),
+            (100.0, OrderSide::Sell, 75.0, 50.0, 25.0),
         ] {
             assert_eq!(opening_quantity(held, side, qty, pending), expected);
         }

@@ -383,6 +383,21 @@ final class AppStore {
     /// Rust side checks again right before sending; this is for immediate feedback.
     /// With `requirePrice` false, an unknown cost isn't a problem here (the Rust side
     /// snapshots the ask and checks it before sending).
+    /// The part of a stock order that opens or adds to a position, mirroring
+    /// `session::opening_quantity` (for instant feedback only; Rust decides): the position
+    /// minus what working same-side orders could still fill can be reduced freely.
+    func openingQuantity(symbol: String, side: OrderSide, quantity: Double) -> Double {
+        let symbol = symbol.uppercased()
+        let held = positions
+            .filter { $0.account == account && $0.secType == "STK" && $0.symbol == symbol }
+            .reduce(0) { $0 + $1.quantity }
+        let pending = orders
+            .filter { $0.account == account && $0.secType == "STK" && $0.symbol == symbol && $0.group == .open && $0.isBuy == (side == .buy) }
+            .reduce(0) { $0 + max($1.quantity - $1.filled, 0) }
+        let reducible = side == .buy ? max(-held - pending, 0) : max(held - pending, 0)
+        return max(quantity - reducible, 0)
+    }
+
     func entryProblem(cost: Double?, requirePrice: Bool = true) -> String? {
         guard let risk else { return isLive ? "Risk controls aren't running yet." : nil }
         if let reason = risk.halted { return "Trading is halted for today (\(reason))." }
@@ -697,8 +712,17 @@ final class AppStore {
     // MARK: Positions
 
     /// A running strategy that can close this position through its own OCA group.
+    /// A holding state without `canClose` means the task has stopped (e.g. it lost track of
+    /// the entry). Nothing manages the position then, so manual close / protect must work.
     func strategy(managing p: Position) -> StrategyUpdate? {
-        strategies.first { $0.contractId == p.contractId && ![.closed, .disarmed, .failed].contains($0.state) }
+        strategies.first { s in
+            guard s.contractId == p.contractId else { return false }
+            switch s.state {
+            case .closed, .disarmed, .failed: return false
+            case .protected, .open, .unprotected: return s.canClose
+            case .arming, .armed, .waitingDelayedData, .entering, .closing: return true
+            }
+        }
     }
 
     /// Working orders on the position's contract (any client).
@@ -751,7 +775,7 @@ final class AppStore {
         do {
             let placed: PlacedOrder
             if closing {
-                placed = try await session.closePositionMarket(contractId: request.instrument.contractId, expectedQuantity: reviewedLive ? closeQuantity : nil)
+                placed = try await session.closePositionMarket(contractId: request.instrument.contractId, expectedQuantity: closeQuantity)
             } else {
                 placed = try await session.placeInstrumentOrder(request: request)
             }

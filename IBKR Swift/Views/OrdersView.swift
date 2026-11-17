@@ -261,7 +261,7 @@ private struct OrderConfirmSheet: View {
                     Button(store.isLive ? "Submit LIVE Order" : "Submit Paper Order") { submit() }
                         .buttonStyle(.borderedProminent)
                         .tint(store.isLive ? .red : .accentColor)
-                        .disabled(request.side == .buy && riskProblem != nil)
+                        .disabled(riskProblem != nil)
                 } else {
                     Button("Done") { dismiss() }
                         .keyboardShortcut(.defaultAction)
@@ -278,13 +278,14 @@ private struct OrderConfirmSheet: View {
         return false
     }
 
-    /// Buys are checked against the risk limits; while halted, sells may only close a long
-    /// (the Rust side checks the shares held).
+    /// Only the part that opens or adds to a position is checked against the risk limits,
+    /// so selling a long or buying back a short always works, even while halted. The Rust
+    /// side re-checks against IB's position and working orders.
     private var riskProblem: String? {
-        if request.side == .sell {
-            return store.risk?.halted.map { _ in "Trading is halted: this sell is only allowed up to the shares you hold." }
-        }
-        return store.entryProblem(cost: OrderCheck.estimatedValue(request, quote))
+        let opening = store.openingQuantity(symbol: request.symbol, side: request.side, quantity: request.quantity)
+        guard opening > 0 else { return nil }
+        let cost = OrderCheck.estimatedValue(request, quote).map { $0 / request.quantity * opening }
+        return store.entryProblem(cost: cost)
     }
 
     private func submit() {
